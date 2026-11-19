@@ -34,7 +34,7 @@ all: $(BUILD)/libsqdrive.a $(BUILD)/sqdrive $(TESTS)
 
 # sq.cart, by its own Makefile, its outputs in build/sqcart.
 $(CART_OUT) &: $(wildcard $(CART_DIR)/src/*) $(CART_DIR)/Makefile
-	$(MAKE) -C $(CART_DIR) CXX=$(CXX) BUILD=$(CART) OPT="$(OPT)" $(CART_OUT)
+	$(MAKE) -C $(CART_DIR) CXX="$(CXX)" BUILD=$(CART) OPT="$(OPT)" $(CART_OUT)
 
 $(BUILD)/pcm/sq.drive.pcm $(BUILD)/obj/drive.o &: src/drive.cppm $(CART)/pcm/sq.cart.pcm $(CART)/pcm/sq.cart.write.pcm
 	@mkdir -p $(BUILD)/pcm $(BUILD)/obj

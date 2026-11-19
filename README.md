@@ -74,6 +74,30 @@ sqdrive commit CART                            # what --keep left in the journal
 sqdrive recover CART --discard
 ```
 
+## On Android, and in sqterm
+
+**An app.** Android stops an app that leaves the screen, and may end its
+process without another word. squared already says when: the platform calls
+`Application::background()` on Android's stop (`sq::App` gives its model a
+turn there to save). That is where a Drive's changes are made safe:
+
+```cpp
+void background() override {
+    drive.sync();    // in the journal, flushed: they survive what follows
+}
+```
+
+`sync()` is quick (an append and a flush), and what it wrote is replayed
+at the next mount if the process is ended before a commit. A `budget` Drive
+commits it on its own in the meantime; nothing more is needed. Mount with
+`.staging` in the app's private storage (squared's `FileSystem::local`
+folder), not shared storage.
+
+**sqterm.** `pkg install sqdrive` (sqterm's `packages/sqdrive`, built from a
+tag of this repository with clang 23 against sqterm's sysroot and runtimes
+packages). Its journals go in `~/.local/state/sqdrive`, or
+`$SQDRIVE_STAGING`.
+
 ## Building
 
 ```sh
@@ -97,15 +121,16 @@ The phases of the design:
    that misses the cache costs about 3 ms, most of it SHA-256 over the
    1 MiB chunk it verifies (a faster SHA-256 is the next thing to win).
 3. **Writing and the journal** (sqdrive #2).
-4. **Background commits and bounds**: this. A 256 MiB file streamed in
+4. **Background commits and bounds** (sqdrive #3). A 256 MiB file streamed in
    256 KiB writes at `staging_bytes` 24 MiB and `memory_bytes` 4 MiB keeps
    both under their bounds, committing 8 MiB at a time as it goes (the
    design's 2 GiB gate, scaled for CI). A commit still gathers its changes
    in sqcart's writer before it writes them, so while it runs it holds up
    to what it commits in memory: `commit_bytes` (or `staging_bytes`) bounds
    that.
-5. **Hosts**: a pkg recipe for sqterm, the Android hook that commits on
-   `onStop`.
+5. **Hosts**: sqterm's `packages/sqdrive` recipe (`pkg install sqdrive`),
+   and Android's stop: squared's `Application::background()` already
+   carries it, so an app syncs its Drive there (above); no new hook.
 
 ## Licence
 
