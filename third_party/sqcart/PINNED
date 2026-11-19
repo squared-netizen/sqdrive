@@ -1,9 +1,9 @@
 # sqcart's 3.0 library, copied by tools/vendor_sqcart.sh.
 # Do not edit: change it in sqcart, then copy it again.
-from: sqcart 6dc7a0a1831160f618908ef5a85fbc248cdb1d6d
+from: sqcart cd9b64a2388145cca72715e48bced9e97f0a03e1
 copied: 2026-11-19
 05d8449c7eda2c00825a8e1137be920ee804adcbcc127954c403b0a8620cfcf8  v3/Makefile
-594158a51feeee8515732fac50dbdc2d8faf145b29d7a05fb445af7a294533fb  v3/src/archive.cppm
+a5dba3efe38c9b29d4fdeef416d64d874f6b869b91723d94a17defd3b16b99a3  v3/src/archive.cppm
 71d840c949c093bee09a2a7d10c7e49ee1758e3b12020c6dab589b9eac3ad0d0  v3/src/bytes.cppm
 43e2a62bc088c1705709b9f0bdbad058d0e906643e5bf03e8d93dc2cee654523  v3/src/casefold.inc
 151edb5a0ef9227eeb74f9ef877a6722e15626ba61efb198967d63ba7d99d963  v3/src/ed25519.cppm
@@ -14,5 +14,5 @@ ae2ed6e3737ac01c52bda5682ad90fcc682769247f7b671e20b9dc066d6652b6  v3/src/fold.cp
 926f2dd4a8b98d050780396b1ee5758d0411ff2514e3f9ca41994c0015df85fa  v3/src/nfc.inc
 f337afb6daf177f74fdbf0e5014afc5e1570382f6e23501caa1a6c847b83a3aa  v3/src/sha256.cppm
 210e338ca813c8d23d6ced05301347c76b598830d949aa057a5e829661af870a  v3/src/sq.cart.cppm
-dc9053d3676bb8a25b2e60e5cac01d0346ce2b33d827e7929f0bd1448c69fe62  v3/src/write.cppm
+588ae5098a851f178bc2b94e150f7db4bd75744afa95359399d7d7aa89a1e4c3  v3/src/write.cppm
 c9a9b46ada3398803d6ef70d220fc68d2bb6cc8668460cee6102f07146825cf8  v3/src/zstd.cppm

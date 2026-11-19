@@ -569,6 +569,39 @@ public:
         return {};
     }
 
+    /// put_range with its bytes in a file: `length` bytes of `file` from
+    /// `file_offset`, read at commit a chunk at a time, never held whole (a
+    /// Drive commits its journal so). The file must stay as it is until the
+    /// commit.
+    Result<void> put_range_file(std::string_view path, std::uint64_t offset, std::filesystem::path file, std::uint64_t file_offset,
+                                std::uint64_t length) {
+        std::error_code ec;
+        const std::uint64_t have = std::filesystem::file_size(file, ec);
+        if (ec) return fail(Code::io, std::format("cannot read {}: {}", file.string(), ec.message()), std::string(path));
+        if (file_offset > have || length > have - file_offset) {
+            return fail(Code::io, std::format("{} holds {} bytes, not {} from {}", file.string(), have, length, file_offset), std::string(path));
+        }
+        auto s = editable(path, "put_range_file");
+        if (!s) return std::unexpected(s.error());
+        if (offset > options_.limits.max_entry_size || length > options_.limits.max_entry_size - offset) {
+            return fail(Code::limit, "the entry would grow past the size limit", std::string(path));
+        }
+        Staged::Op op;
+        op.kind = Staged::Op::Kind::write;
+        op.offset = offset;
+        op.file = std::move(file);
+        op.file_offset = file_offset;
+        op.file_length = length;
+        if ((*s)->kind == Staged::Kind::put) {
+            // An entry put in this commit is in memory already: the bytes join it.
+            auto& c = (*s)->content;
+            if (offset + length > c.size()) c.resize(static_cast<std::size_t>(offset + length));
+            return op.copy(0, std::span(c).subspan(static_cast<std::size_t>(offset), static_cast<std::size_t>(length)));
+        }
+        (*s)->ops.push_back(std::move(op));
+        return {};
+    }
+
     /// Make an entry `size` bytes long: cut, or grown with zeros. A chunked
     /// entry keeps every chunk below the cut as it is; any other entry is
     /// read and put again (it is at most 64 MiB).
@@ -682,6 +715,27 @@ private:
             enum class Kind : std::uint8_t { write, resize } kind = Kind::write;
             std::uint64_t offset = 0;  ///< where a write goes; a resize's new size
             std::vector<std::byte> bytes;
+            /// A write from a file (put_range_file): `file_length` bytes at
+            /// `file_offset`, read at commit.
+            std::optional<std::filesystem::path> file;
+            std::uint64_t file_offset = 0, file_length = 0;
+
+            [[nodiscard]] std::uint64_t length() const noexcept { return file ? file_length : bytes.size(); }
+
+            /// Bytes [at, at + out.size()) of what it writes.
+            Result<void> copy(std::uint64_t at, std::span<std::byte> out) const {
+                if (!file) {
+                    std::copy_n(bytes.begin() + static_cast<std::ptrdiff_t>(at), static_cast<std::ptrdiff_t>(out.size()), out.begin());
+                    return {};
+                }
+                std::ifstream in(*file, std::ios::binary);
+                in.seekg(static_cast<std::streamoff>(file_offset + at));
+                in.read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(out.size()));
+                if (!in || static_cast<std::size_t>(in.gcount()) != out.size()) {
+                    return fail(Code::io, std::format("cannot read {} bytes of {} at {} (did it change?)", out.size(), file->string(), file_offset + at));
+                }
+                return {};
+            }
         };
         /// put: new content (`content`, or `file` read at commit) and `options`.
         /// remove: a tombstone. forget: nothing (it was never committed).
@@ -697,7 +751,7 @@ private:
 
         /// The size after `ops`, from `base`.
         [[nodiscard]] std::uint64_t size_after(std::uint64_t base) const noexcept {
-            for (const Op& op : ops) base = op.kind == Op::Kind::resize ? op.offset : std::max(base, op.offset + op.bytes.size());
+            for (const Op& op : ops) base = op.kind == Op::Kind::resize ? op.offset : std::max(base, op.offset + op.length());
             return base;
         }
     };
@@ -759,8 +813,10 @@ private:
             if (op.kind == Staged::Op::Kind::resize) {
                 put.content.resize(static_cast<std::size_t>(op.offset));
             } else {
-                if (op.offset + op.bytes.size() > put.content.size()) put.content.resize(static_cast<std::size_t>(op.offset + op.bytes.size()));
-                std::ranges::copy(op.bytes, put.content.begin() + static_cast<std::ptrdiff_t>(op.offset));
+                if (op.offset + op.length() > put.content.size()) put.content.resize(static_cast<std::size_t>(op.offset + op.length()));
+                if (auto r = op.copy(0, std::span(put.content).subspan(static_cast<std::size_t>(op.offset), static_cast<std::size_t>(op.length()))); !r) {
+                    return std::unexpected(r.error());
+                }
             }
         }
         s = std::move(put);
@@ -821,6 +877,9 @@ private:
     std::map<std::uint32_t, std::vector<std::byte>> dictionaries_;  // by ID, trained or read
     Commit current_{};
     bool has_commit_ = false;
+    bool sealed_ = false;  // this commit's record is written: no cutting back
+
+    Result<Commit> commit_staged();
 
 };
 
@@ -1152,7 +1211,7 @@ Result<void> Writer::apply_ops(const Archive& before, const Entry& base, std::sp
             size = op.offset;
             floor = std::min(floor, size);
         } else {
-            size = std::max(size, op.offset + op.bytes.size());
+            size = std::max(size, op.offset + op.length());
         }
     }
     out.clear();
@@ -1169,7 +1228,7 @@ Result<void> Writer::apply_ops(const Archive& before, const Entry& base, std::sp
         const bool had = i < old.size();
         bool touched = !had || old[i].size != hi - lo || floor < lo + old[i].size;
         for (const Op& op : ops) {
-            if (op.kind == Op::Kind::write && op.offset < hi && op.offset + op.bytes.size() > lo) touched = true;
+            if (op.kind == Op::Kind::write && op.offset < hi && op.offset + op.length() > lo) touched = true;
         }
         if (!touched) {
             out.push_back(old[i]);
@@ -1187,10 +1246,10 @@ Result<void> Writer::apply_ops(const Archive& before, const Entry& base, std::sp
                 if (op.offset < hi) std::fill(piece.begin() + static_cast<std::ptrdiff_t>(std::max(lo, op.offset) - lo), piece.end(), std::byte{0});
                 continue;
             }
-            const std::uint64_t from = std::max(lo, op.offset), to = std::min(hi, op.offset + op.bytes.size());
+            const std::uint64_t from = std::max(lo, op.offset), to = std::min(hi, op.offset + op.length());
             if (from < to) {
-                std::copy(op.bytes.begin() + static_cast<std::ptrdiff_t>(from - op.offset), op.bytes.begin() + static_cast<std::ptrdiff_t>(to - op.offset),
-                          piece.begin() + static_cast<std::ptrdiff_t>(from - lo));
+                auto into = std::span(piece).subspan(static_cast<std::size_t>(from - lo), static_cast<std::size_t>(to - from));
+                if (auto r = op.copy(from - op.offset, into); !r) return std::unexpected(Error{r.error().code, r.error().message, base.path});
             }
         }
         auto c = write_chunk(file_, piece, options_);
@@ -1232,7 +1291,17 @@ Result<std::vector<Chunk>> Writer::put_streamed(const std::filesystem::path& sou
     return list;
 }
 
+/// A commit that fails before its record is written leaves the file as it
+/// was: what it appended is cut off again.
 Result<Commit> Writer::commit() {
+    const std::uint64_t start = file_.size();
+    sealed_ = false;
+    auto c = commit_staged();
+    if (!c && !sealed_) static_cast<void>(file_.truncate(start));
+    return c;
+}
+
+Result<Commit> Writer::commit_staged() {
     if (staged_.empty()) return fail(Code::malformed, "nothing staged to commit");
     // The live state after this commit, and the records this commit writes.
     auto live = live_;
@@ -1342,9 +1411,23 @@ Result<Commit> Writer::commit() {
         live.insert_or_assign(path, e);
     }
     if (!live.contains("SQ-INF/manifest.json")) return fail(Code::malformed, "a cartridge needs SQ-INF/manifest.json (§4.1)");
-    // Case collisions (§4.1), before anything is sealed.
+    // Case collisions (§4.1), before anything is sealed; none to look for
+    // when the manifest committed says case_sensitive.
+    bool case_sensitive = false;
+    if (auto m = staged_.find("SQ-INF/manifest.json"); m != staged_.end() && m->second.kind == Staged::Kind::put) {
+        auto parsed = data::parse_json(std::string_view(reinterpret_cast<const char*>(m->second.content.data()), m->second.content.size()));
+        if (const data::JsonValue* cs = parsed ? parsed.value.find("case_sensitive") : nullptr; cs && cs->boolean_if()) case_sensitive = *cs->boolean_if();
+    } else if (has_commit_) {
+        if (!before) {
+            auto a = Archive::open(file_.path(), ReadOptions{options_.limits});
+            if (!a) return std::unexpected(a.error());
+            before = std::move(*a);
+        }
+        case_sensitive = before->manifest().case_sensitive;
+    }
     std::map<std::u32string, std::string_view> keys;
     for (const auto& [path, e] : live) {
+        if (case_sensitive) break;
         auto [it, fresh] = keys.try_emplace(collision_key(path), path);
         if (!fresh) return fail(Code::path, std::format("collides with \"{}\" on a case-insensitive file system", it->second), path);
     }
@@ -1366,6 +1449,7 @@ Result<Commit> Writer::commit() {
             }
         }
     }
+    sealed_ = true;  // from here a slot may name it: a failure keeps what was written
     auto c = seal(file_, options_, std::move(records), std::move(chunks), live, data_offset,
                   has_commit_ ? std::optional<Commit>(current_) : std::nullopt, full, keys_);
     if (!c) return std::unexpected(c.error());

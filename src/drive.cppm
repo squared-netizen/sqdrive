@@ -1105,10 +1105,17 @@ struct File::State {
                 if (ov.size != (cut ? ov.floor : ov.base->size)) {
                     if (auto r = w.resize(path, ov.size); !r) return std::unexpected(r.error());
                 }
+                // A synced chunk is read from its journal segment at commit,
+                // a chunk at a time (put_range_file): the commit holds none
+                // of them in memory. One still in memory goes as it is.
                 for (const auto& [i, piece] : ov.chunks) {
-                    const auto bytes = std::span(buf).first(static_cast<std::size_t>(piece.size()));
-                    if (auto r = read_piece(piece, 0, bytes); !r) return std::unexpected(r.error());
-                    if (auto r = w.put_range(path, i * chunk_size, bytes); !r) return std::unexpected(r.error());
+                    if (piece.file) {
+                        if (auto r = w.put_range_file(path, i * chunk_size, piece.file->path, piece.at, piece.length); !r) {
+                            return std::unexpected(r.error());
+                        }
+                    } else if (auto r = w.put_range(path, i * chunk_size, piece.bytes); !r) {
+                        return std::unexpected(r.error());
+                    }
                 }
                 continue;
             }

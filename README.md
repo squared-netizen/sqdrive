@@ -124,10 +124,9 @@ The phases of the design:
 4. **Background commits and bounds** (sqdrive #3). A 256 MiB file streamed in
    256 KiB writes at `staging_bytes` 24 MiB and `memory_bytes` 4 MiB keeps
    both under their bounds, committing 8 MiB at a time as it goes (the
-   design's 2 GiB gate, scaled for CI). A commit still gathers its changes
-   in sqcart's writer before it writes them, so while it runs it holds up
-   to what it commits in memory: `commit_bytes` (or `staging_bytes`) bounds
-   that.
+   design's 2 GiB gate, scaled for CI). A commit reads the chunks it
+   writes from the journal (sqcart's `put_range_file`), so while it runs
+   it holds none of them in memory.
 5. **Hosts**: sqterm's `packages/sqdrive` recipe (`pkg install sqdrive`),
    and Android's stop: squared's `Application::background()` already
    carries it, so an app syncs its Drive there (above); no new hook.
