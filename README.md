@@ -32,23 +32,34 @@ content, so an unchanged chunk stays cached across commits.
 
 **Writing.** A read-write mount holds sqcart's writer lock until it
 unmounts (a second one gets `Code::busy`). Writes change 1 MiB chunks in
-memory; `sync()` appends what changed to a journal in the staging folder
-(one per cartridge, never beside it) and flushes it; a commit hands
-everything to sqcart as one commit, naming again every chunk no write
-touched, and starts the journal again. Entries without the `w` flag are
-not changed (§4.2). The policy says when to commit on its own:
-`budget` (past `commit_bytes`, or `commit_after` since the first change,
-and at unmount), `explicit_only`, or `on_unmount`. Past `staging_bytes`, a
-write commits first (`budget`) or gets `Code::limit`.
+memory; `sync()` appends what changed to the journal in the staging folder
+(one per cartridge, never beside it) and flushes it, and the synced chunks
+leave memory: they are read back from the journal. Past `memory_bytes` a
+write syncs first, so memory stays bounded however much is staged. Entries
+without the `w` flag are not changed (§4.2).
 
-**After a crash**, the next read-write mount reads the journal up to its
-last sync whose checksum passes (a torn tail is dropped) and:
+**Committing.** A commit freezes what is staged, starts a new journal
+segment for the writes that go on meanwhile, and hands the frozen changes
+to sqcart as one commit, naming again every chunk no write touched; only a
+write to a path being committed waits for it. With the `budget` policy
+(the default) commits run on a thread of their own, past `commit_bytes` or
+once the oldest change is `commit_after` old, and at unmount; with
+`explicit_only` only on `commit()`; with `on_unmount` also at unmount. Past
+`staging_bytes` a write waits for a commit (`budget`) or gets `Code::limit`.
+Files the Drive makes are stored chunked, so later commits write only the
+chunks they change. After a commit with nothing else staged, the Drive
+compacts the cartridge (§10.4) when `compact_min_bytes` and `compact_at` of
+it are unreachable; writers wait meanwhile, readers do not. `wait()` waits
+for background commits and reports one that failed.
+
+**After a crash**, the next read-write mount reads each journal segment up
+to its last sync whose checksum passes (a torn tail is dropped) and:
 
 | The cartridge is | The Drive |
 | --- | --- |
-| at the journal's commit | replays what was synced; it commits as the policy says |
-| one commit on, with the time the journal wrote down before committing | knows its commit landed; drops the journal |
-| anywhere else (another writer committed) | refuses with `Code::conflict`, or, with `discard_journal`, sets the journal aside as `journal.conflict-<time>` |
+| at the segments' commit | replays them all; it commits as the policy says |
+| one commit on, with the time a segment wrote down before committing | knows that commit landed: drops that segment and those before it, replays the ones after |
+| anywhere else (another writer committed) | refuses with `Code::conflict`, or, with `discard_journal`, sets the segments aside as `journal.conflict-<time>.<n>` |
 
 ```sh
 sqdrive ls CART [PREFIX]
@@ -85,10 +96,14 @@ The phases of the design:
    container's disk: sequential reads about 200 MiB/s; a random 4 KiB read
    that misses the cache costs about 3 ms, most of it SHA-256 over the
    1 MiB chunk it verifies (a faster SHA-256 is the next thing to win).
-3. **Writing and the journal**: this. Changes are held in memory until
-   they are committed (synced ones in the journal too); phase 4 lets
-   synced chunks leave memory.
-4. **Background commits and backpressure.**
+3. **Writing and the journal** (sqdrive #2).
+4. **Background commits and bounds**: this. A 256 MiB file streamed in
+   256 KiB writes at `staging_bytes` 24 MiB and `memory_bytes` 4 MiB keeps
+   both under their bounds, committing 8 MiB at a time as it goes (the
+   design's 2 GiB gate, scaled for CI). A commit still gathers its changes
+   in sqcart's writer before it writes them, so while it runs it holds up
+   to what it commits in memory: `commit_bytes` (or `staging_bytes`) bounds
+   that.
 5. **Hosts**: a pkg recipe for sqterm, the Android hook that commits on
    `onStop`.
 

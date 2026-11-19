@@ -252,7 +252,7 @@ int main() {
             auto d = Drive::mount(cart, o);
             auto f = d->open("f.bin", mode::write);
             for (int i = 0; i < 5; ++i) static_cast<void>(f->write(static_cast<std::uint64_t>(i) * mib, pattern(mib, 8)));
-            check(d->head().sequence > 1, "budget: a commit past commit_bytes, unasked");
+            check(d->wait().has_value() && d->head().sequence > 1, "budget: a commit past commit_bytes, unasked");
         }
         {
             auto o = writing(Policy::explicit_only);
