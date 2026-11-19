@@ -120,6 +120,9 @@ struct Manifest {
     std::string version;
     std::string kind;
     std::string json;  ///< the entry's text, as stored
+    /// `case_sensitive: true` (§4.1): its paths may collide under case
+    /// folding; it is for case-sensitive file systems.
+    bool case_sensitive = false;
 };
 
 /// One signature (§9.3, A.5).
@@ -800,6 +803,7 @@ private:
         for (auto& [path, e] : live) out.push_back(std::move(e));
         std::map<std::u32string, std::string_view> keys;
         for (const Entry& e : out) {
+            if (manifest_.case_sensitive) break;
             auto [it, fresh] = keys.try_emplace(collision_key(e.path), e.path);
             if (!fresh) return fail(Code::path, std::format("collides with \"{}\" on a case-insensitive file system", it->second), e.path);
         }
@@ -932,6 +936,10 @@ private:
         auto kind = json_string_member(*json, "kind");
         if (!id || !version || !kind) return fail(Code::malformed, "the manifest has no id, version or kind", std::string(manifest_path));
         manifest_ = Manifest{std::move(*id), std::move(*version), std::move(*kind), std::string(text)};
+        if (const data::JsonValue* cs = json->find("case_sensitive")) {
+            if (cs->boolean_if() == nullptr) return fail(Code::malformed, "the manifest's case_sensitive is not true or false", std::string(manifest_path));
+            manifest_.case_sensitive = *cs->boolean_if();
+        }
         return {};
     }
 
