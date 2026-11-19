@@ -7,11 +7,14 @@
 // policy and recovery ("Virtual Cartridge Drive: design").
 //
 // Reads go through a cache of decoded chunks. Writes change 1 MiB chunks in
-// memory; sync() appends them to a journal in the Drive's own storage and
-// flushes it, so they survive a crash; a commit hands them to sqcart as one
-// commit, then starts the journal again. At mount, a journal the cartridge
-// has not moved past is replayed; one whose commit landed is dropped; one
-// the cartridge has moved past otherwise is a conflict (Code::conflict).
+// memory; sync() appends them to the journal in the Drive's own storage and
+// flushes it, so they survive a crash, and they leave memory: a synced chunk
+// is read back from the journal. A commit freezes what is staged, starts a
+// new journal segment for the writes that go on meanwhile, and hands the
+// frozen changes to sqcart as one commit, on a thread of its own when the
+// policy commits by budget. At mount, segments a landed commit covered are
+// dropped and the rest replayed; a cartridge moved on by another writer is
+// a conflict (Code::conflict).
 
 module;
 
@@ -61,8 +64,16 @@ struct MountOptions {
     /// Changes held at most, in bytes: past it, a write commits first
     /// (budget) or is refused with Code::limit.
     std::uint64_t staging_bytes = std::uint64_t{1} << 30;
+    /// Changes held in memory at most, in bytes: past it, a write syncs
+    /// them to the journal first, and they are read back from there.
+    std::uint64_t memory_bytes = std::uint64_t{32} << 20;
+    /// After a commit with nothing else staged, compact the cartridge
+    /// (§10.4) when at least compact_min_bytes and compact_at of it are
+    /// unreachable. Writers wait meanwhile; readers do not. compact_at 0: never.
+    double compact_at = 0.5;
+    std::uint64_t compact_min_bytes = std::uint64_t{64} << 20;
     /// A journal the cartridge has moved past (another writer committed
-    /// after a crash): set it aside as journal.conflict-<time> and start
+    /// after a crash): set it aside as journal.conflict-<time>.<n> and start
     /// again, rather than refuse the mount with Code::conflict.
     bool discard_journal = false;
     sq::cart::ReadOptions read{};
@@ -147,9 +158,12 @@ public:
     Result<void> rename(std::string_view from, std::string_view to);
     /// Make every change so far survive a crash.
     Result<void> sync();
-    /// Commit every change as one sqcart commit; the current commit when
-    /// there is nothing to commit.
+    /// Commit every change as one sqcart commit (after any commit running
+    /// in the background); the current commit when there is nothing to commit.
     Result<sq::cart::Commit> commit();
+    /// Wait until no commit is running or asked for; the error of a
+    /// background commit that failed since the last call, if one did.
+    Result<void> wait();
     /// Commit or sync as the policy says, release the lock, end writing.
     Result<void> unmount();
 
@@ -158,7 +172,9 @@ public:
     [[nodiscard]] const std::filesystem::path& path() const noexcept;
     /// Bytes of changes held, synced or not, not yet committed.
     [[nodiscard]] std::uint64_t staged_bytes() const;
-    /// The journal of a read-write mount.
+    /// Bytes of changes held in memory (not yet synced).
+    [[nodiscard]] std::uint64_t memory_bytes() const;
+    /// The journal segment a read-write mount writes to now.
     [[nodiscard]] std::filesystem::path journal_path() const;
     [[nodiscard]] CacheStats cache_stats() const;
     /// Drop every cached chunk (a cold cache, for measuring).
@@ -184,10 +200,14 @@ std::string errno_text(std::string_view what, const fs::path& path) { return std
 
 /// Where a test can make the process stop dead (SQDRIVE_CRASH=<point>), as
 /// a crash would: before_commit (the journal says a commit is coming) and
-/// after_commit (it landed; the journal does not know yet).
+/// after_commit (it landed; the journal does not know yet). Tests only.
 void crash_point(std::string_view where) {
     const char* const at = std::getenv("SQDRIVE_CRASH");  // each time: a test sets it in a child
-    if (at != nullptr && where == at) std::_Exit(86);
+    if (at == nullptr || where != at) return;
+    // SQDRIVE_CRASH_DELAY_MS: stop only after that long, so that a test can
+    // write on meanwhile, into the next segment.
+    if (const char* delay = std::getenv("SQDRIVE_CRASH_DELAY_MS")) std::this_thread::sleep_for(std::chrono::milliseconds(std::atoi(delay)));
+    std::_Exit(86);
 }
 
 std::int64_t now_ms() {
@@ -270,6 +290,7 @@ private:
     CacheStats stats_;
 };
 
+
 // -------------------------------------------------------------- the journal
 
 /// CRC-32C (Castagnoli), as iSCSI and ext4 use it.
@@ -293,15 +314,20 @@ std::uint32_t crc32c(std::span<const std::byte> bytes, std::uint32_t crc = 0) no
 /// (u8), the payload, and a CRC-32C of type and payload (u32). Only what
 /// comes before a `sync` record whose CRC passes is replayed.
 enum class Rec : std::uint8_t {
-    entry = 1,       ///< a path's state: flags (removed, reset), its base's path, size, floor
+    entry = 1,       ///< a path's state: flags (removed, base, reset), its base's path, size, floor
     chunk = 2,       ///< a path's chunk: index, its bytes now
     rename = 3,      ///< from, to: what is staged at `from` moves to `to`
     sync = 4,        ///< everything before is durable
-    committing = 5,  ///< the time (ms) of the commit about to be made
+    committing = 5,  ///< the time (ms) of the commit about to be made of this segment's changes
+    aborted = 6,     ///< that commit failed; it did not land
 };
 
+/// The journal is a series of segments, journal.<n>, each written by one
+/// generation of changes. Its header: magic, the commit it applies on
+/// (u64), and a CRC-32C of both.
 constexpr std::string_view journal_magic = "SQDRIVE1";
-constexpr std::size_t journal_header = 20;  // magic, base commit sequence (u64), CRC-32C of both (u32)
+constexpr std::size_t journal_header = 20;
+constexpr std::size_t max_record = (std::size_t{1} << 20) + 4096;
 
 void put_u(std::vector<std::byte>& out, std::uint64_t v, int n) {
     for (int i = 0; i < n; ++i) out.push_back(static_cast<std::byte>(v >> (8 * i)));
@@ -337,176 +363,222 @@ struct Cursor {
         at += n;
         return out;
     }
-    std::span<const std::byte> rest() {
-        auto r = b.subspan(at);
-        at = b.size();
-        return r;
+};
+
+Result<void> pread_all(int fd, std::uint64_t at, std::span<std::byte> out, const fs::path& path) {
+    std::size_t done = 0;
+    while (done < out.size()) {
+        const ssize_t n = ::pread(fd, out.data() + done, out.size() - done, static_cast<off_t>(at + done));
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return fail(Code::io, errno_text("cannot read", path));
+        done += static_cast<std::size_t>(n);
+    }
+    return {};
+}
+
+Result<void> pwrite_all(int fd, std::uint64_t at, std::span<const std::byte> bytes, const fs::path& path) {
+    std::size_t done = 0;
+    while (done < bytes.size()) {
+        const ssize_t n = ::pwrite(fd, bytes.data() + done, bytes.size() - done, static_cast<off_t>(at + done));
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return fail(Code::io, errno_text("cannot write", path));
+        done += static_cast<std::size_t>(n);
+    }
+    return {};
+}
+
+Result<void> flush_folder(const fs::path& file) {
+    const int fd = ::open(file.parent_path().c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) return fail(Code::io, errno_text("cannot open the folder of", file));
+    const int r = ::fsync(fd);
+    ::close(fd);
+    if (r != 0 && errno != EINVAL) return fail(Code::io, errno_text("cannot flush the folder of", file));
+    return {};
+}
+
+/// One segment's file, open; shared by the chunks that live in it, so it
+/// stays readable until the last of them is gone.
+struct SegmentFile {
+    int fd = -1;
+    fs::path path;
+    SegmentFile(int f, fs::path p) : fd(f), path(std::move(p)) {}
+    SegmentFile(const SegmentFile&) = delete;
+    SegmentFile& operator=(const SegmentFile&) = delete;
+    ~SegmentFile() {
+        if (fd >= 0) ::close(fd);
     }
 };
 
+std::vector<std::byte> header_bytes(std::uint64_t base) {
+    std::vector<std::byte> h;
+    const auto m = std::as_bytes(std::span(journal_magic));
+    h.insert(h.end(), m.begin(), m.end());
+    put_u(h, base, 8);
+    put_u(h, crc32c(h), 4);
+    return h;
+}
+
+/// A record read back: a chunk's bytes are not read, only where they are.
 struct Record {
-    Rec type;
-    std::vector<std::byte> payload;
+    Rec type{};
+    std::vector<std::byte> payload;  ///< a chunk record's: its path and index only
+    std::uint64_t data_at = 0;       ///< a chunk record's bytes, in the segment
+    std::uint32_t data_length = 0;
 };
 
-/// What a journal holds: its base, and its records up to its last sync.
-struct JournalContents {
+/// What a segment holds, up to its last sync.
+struct SegmentContents {
+    std::uint64_t number = 0;
+    fs::path path;
     std::uint64_t base = 0;
     std::vector<Record> records;
-    std::uint64_t end = journal_header;            ///< just past the last sync
-    std::optional<std::int64_t> committing;        ///< the last commit it was about to make
+    std::optional<std::int64_t> committing;  ///< a commit it was about to make (not aborted)
+    std::shared_ptr<SegmentFile> file;
 };
 
-/// An append-only journal file: records gather in memory and reach the
-/// file, flushed to storage, on flush().
-class Journal {
+/// The segment being written: records gather in memory and reach the file,
+/// with a sync record, flushed to storage, on flush().
+class Segment {
 public:
-    Journal() = default;
-    Journal(Journal&& o) noexcept : fd_(std::exchange(o.fd_, -1)), path_(std::move(o.path_)), end_(o.end_), pending_(std::move(o.pending_)) {}
-    Journal& operator=(Journal&& o) noexcept {
-        if (this != &o) {
-            close();
-            fd_ = std::exchange(o.fd_, -1);
-            path_ = std::move(o.path_);
-            end_ = o.end_;
-            pending_ = std::move(o.pending_);
-        }
-        return *this;
-    }
-    ~Journal() { close(); }
+    Segment() = default;
 
-    /// A new, empty journal on `base`: written beside, flushed, renamed over
-    /// any old one, the folder flushed; a crash leaves the old or the new.
-    static Result<Journal> create(const fs::path& path, std::uint64_t base, bool sync) {
+    /// A new, empty segment on `base`: written beside, flushed, renamed into place.
+    static Result<Segment> create(const fs::path& path, std::uint64_t base, bool sync) {
         fs::path temporary = path;
         temporary += ".new";
-        std::vector<std::byte> header;
-        const auto m = std::as_bytes(std::span(journal_magic));
-        header.insert(header.end(), m.begin(), m.end());
-        put_u(header, base, 8);
-        put_u(header, crc32c(header), 4);
-        const int fd = ::open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+        const auto header = header_bytes(base);
+        const int fd = ::open(temporary.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
         if (fd < 0) return fail(Code::io, errno_text("cannot create", temporary));
-        const bool written = ::write(fd, header.data(), header.size()) == static_cast<ssize_t>(header.size()) && (!sync || ::fsync(fd) == 0);
-        ::close(fd);
-        if (!written) return fail(Code::io, errno_text("cannot write", temporary));
-        if (::rename(temporary.c_str(), path.c_str()) != 0) return fail(Code::io, errno_text("cannot rename over", path));
+        auto file = std::make_shared<SegmentFile>(fd, path);
+        if (auto r = pwrite_all(fd, 0, header, temporary); !r) return std::unexpected(r.error());
+        if (sync && ::fsync(fd) != 0) return fail(Code::io, errno_text("cannot flush", temporary));
+        if (::rename(temporary.c_str(), path.c_str()) != 0) return fail(Code::io, errno_text("cannot rename into", path));
         if (sync) {
             if (auto r = flush_folder(path); !r) return std::unexpected(r.error());
         }
-        return append_to(path, journal_header);
+        Segment s;
+        s.file_ = std::move(file);
+        s.end_ = journal_header;
+        return s;
     }
 
-    /// An existing journal, opened to append after `end` (a torn tail past
-    /// its last sync is cut off).
-    static Result<Journal> append_to(const fs::path& path, std::uint64_t end) {
-        const int fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
+    /// Read a segment up to its last sync whose CRC passes; streamed, so a
+    /// large segment is never held whole.
+    static Result<SegmentContents> read(const fs::path& path, std::uint64_t number) {
+        const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
         if (fd < 0) return fail(Code::io, errno_text("cannot open", path));
-        if (::ftruncate(fd, static_cast<off_t>(end)) != 0) {
-            ::close(fd);
-            return fail(Code::io, errno_text("cannot truncate", path));
-        }
-        Journal j;
-        j.fd_ = fd;
-        j.path_ = path;
-        j.end_ = end;
-        return j;
-    }
-
-    static Result<JournalContents> read(const fs::path& path) {
-        std::ifstream in(path, std::ios::binary);
-        if (!in) return fail(Code::io, "cannot read " + path.string());
-        std::vector<char> text{std::istreambuf_iterator<char>(in), {}};
-        const auto b = std::as_bytes(std::span(text));
-        JournalContents c;
-        if (b.size() < journal_header || std::string_view(text.data(), 8) != journal_magic) {
-            return fail(Code::malformed, path.string() + " is not a Drive journal");
-        }
-        Cursor h{b.subspan(8, 12)};
+        SegmentContents c;
+        c.number = number;
+        c.path = path;
+        c.file = std::make_shared<SegmentFile>(fd, path);
+        struct stat st{};
+        ::fstat(fd, &st);
+        const auto size = static_cast<std::uint64_t>(st.st_size);
+        std::vector<std::byte> header(journal_header);
+        if (size < journal_header || !pread_all(fd, 0, header, path)) return fail(Code::malformed, path.string() + " is not a Drive journal");
+        if (std::string_view(reinterpret_cast<const char*>(header.data()), 8) != journal_magic) return fail(Code::malformed, path.string() + " is not a Drive journal");
+        Cursor h{std::span(header).subspan(8)};
         c.base = h.u(8);
-        if (h.u(4) != crc32c(b.first(16))) return fail(Code::malformed, path.string() + ": its header does not match its CRC");
+        if (h.u(4) != crc32c(std::span(header).first(16))) return fail(Code::malformed, path.string() + ": its header does not match its CRC");
         std::vector<Record> tentative;
-        std::optional<std::int64_t> committing;
-        for (std::size_t at = journal_header; b.size() - at >= 9;) {
-            Cursor r{b.subspan(at)};
+        std::optional<std::int64_t> committing = std::nullopt;
+        std::vector<std::byte> buf;
+        for (std::uint64_t at = journal_header; size - at >= 9;) {
+            std::array<std::byte, 5> head{};
+            if (!pread_all(fd, at, head, path)) break;
+            Cursor r{head};
             const auto len = static_cast<std::size_t>(r.u(4));
-            if (b.size() - at - 9 < len) break;  // torn
-            const auto type_and_payload = b.subspan(at + 4, 1 + len);
-            Cursor t{b.subspan(at + 5 + len, 4)};
-            if (t.u(4) != crc32c(type_and_payload)) break;  // torn or damaged: what follows is not trusted
-            const auto type = static_cast<Rec>(std::to_integer<std::uint8_t>(type_and_payload[0]));
-            const auto payload = type_and_payload.subspan(1);
+            if (len > max_record || size - at - 9 < len) break;  // torn, or not a record
+            buf.resize(len + 4);
+            if (!pread_all(fd, at + 5, buf, path)) break;
+            Cursor t{std::span(buf).subspan(len)};
+            const std::byte type_byte = head[4];
+            if (t.u(4) != crc32c(std::span(buf).first(len), crc32c(std::span(&type_byte, 1)))) break;  // torn or damaged: what follows is not trusted
+            const auto type = static_cast<Rec>(std::to_integer<std::uint8_t>(type_byte));
+            const std::span<const std::byte> payload(buf.data(), len);
+            const std::uint64_t payload_at = at + 5;
             at += 9 + len;
-            if (type == Rec::sync) {
-                std::ranges::move(tentative, std::back_inserter(c.records));
-                tentative.clear();
-                if (committing) c.committing = committing;
-                c.end = at;
-                continue;
+            switch (type) {
+                case Rec::sync:
+                    std::ranges::move(tentative, std::back_inserter(c.records));
+                    tentative.clear();
+                    c.committing = committing;
+                    break;
+                case Rec::committing: {
+                    Cursor p{payload};
+                    committing = static_cast<std::int64_t>(p.u(8));
+                    break;
+                }
+                case Rec::aborted: committing.reset(); break;
+                case Rec::chunk: {
+                    Cursor p{payload};
+                    static_cast<void>(p.s());
+                    static_cast<void>(p.u(8));
+                    if (!p.ok) break;
+                    Record rec{type, std::vector<std::byte>(payload.begin(), payload.begin() + static_cast<std::ptrdiff_t>(p.at)), payload_at + p.at,
+                               static_cast<std::uint32_t>(len - p.at)};
+                    tentative.push_back(std::move(rec));
+                    break;
+                }
+                default: tentative.push_back({type, std::vector<std::byte>(payload.begin(), payload.end()), 0, 0});
             }
-            if (type == Rec::committing) {
-                Cursor p{payload};
-                committing = static_cast<std::int64_t>(p.u(8));
-                continue;
-            }
-            tentative.push_back({type, std::vector<std::byte>(payload.begin(), payload.end())});
         }
         return c;
     }
 
-    void add(Rec type, std::span<const std::byte> payload) {
+    /// Add a record; where its payload will start in the file (once flushed).
+    std::uint64_t add(Rec type, std::span<const std::byte> payload) {
         put_u(pending_, payload.size(), 4);
         const std::byte t{static_cast<std::uint8_t>(type)};
         pending_.push_back(t);
+        const std::uint64_t at = end_ + pending_.size();
         pending_.insert(pending_.end(), payload.begin(), payload.end());
         put_u(pending_, crc32c(payload, crc32c(std::span(&t, 1))), 4);
+        return at;
     }
 
     /// Append what was added and a sync record, and flush to storage.
     Result<void> flush(bool sync) {
         add(Rec::sync, {});
-        std::size_t done = 0;
-        while (done < pending_.size()) {
-            const ssize_t n = ::pwrite(fd_, pending_.data() + done, pending_.size() - done, static_cast<off_t>(end_ + done));
-            if (n < 0 && errno == EINTR) continue;
-            if (n <= 0) {
-                pending_.clear();
-                return fail(Code::io, errno_text("cannot write", path_));
-            }
-            done += static_cast<std::size_t>(n);
-        }
-        if (sync && ::fsync(fd_) != 0) {
+        auto r = pwrite_all(file_->fd, end_, pending_, file_->path);
+        if (r && sync && ::fsync(file_->fd) != 0) r = fail(Code::io, errno_text("cannot flush", file_->path));
+        if (!r) {
             pending_.clear();
-            return fail(Code::io, errno_text("cannot flush", path_));
+            return r;
         }
         end_ += pending_.size();
         pending_.clear();
         return {};
     }
 
-    [[nodiscard]] const fs::path& path() const noexcept { return path_; }
-
-    static Result<void> flush_folder(const fs::path& file) {
-        const int fd = ::open(file.parent_path().c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-        if (fd < 0) return fail(Code::io, errno_text("cannot open the folder of", file));
-        const int r = ::fsync(fd);
-        ::close(fd);
-        if (r != 0 && errno != EINVAL) return fail(Code::io, errno_text("cannot flush the folder of", file));
+    /// Say the segment applies on another commit (its own landed, or the
+    /// cartridge was compacted): its header rewritten in place.
+    Result<void> rebase(std::uint64_t base, bool sync) {
+        if (auto r = pwrite_all(file_->fd, 0, header_bytes(base), file_->path); !r) return r;
+        if (sync && ::fsync(file_->fd) != 0) return fail(Code::io, errno_text("cannot flush", file_->path));
         return {};
     }
 
+    [[nodiscard]] const std::shared_ptr<SegmentFile>& file() const noexcept { return file_; }
+    [[nodiscard]] bool empty() const noexcept { return end_ == journal_header; }
+
 private:
-    void close() noexcept {
-        if (fd_ >= 0) ::close(fd_);
-        fd_ = -1;
-    }
-    int fd_ = -1;
-    fs::path path_;
+    std::shared_ptr<SegmentFile> file_;
     std::uint64_t end_ = journal_header;
     std::vector<std::byte> pending_;
 };
 
 // -------------------------------------------------------------- the overlay
+
+/// A changed chunk's bytes: in memory (not synced yet, or loaded back to
+/// change), or in a journal segment (synced).
+struct Piece {
+    std::vector<std::byte> bytes;
+    std::shared_ptr<SegmentFile> file;
+    std::uint64_t at = 0;
+    std::uint32_t length = 0;
+    [[nodiscard]] std::uint64_t size() const noexcept { return file ? length : bytes.size(); }
+};
 
 /// What is staged at one path: nothing there (removed), or a file built on
 /// a committed entry (`base`, renamed or not) or on nothing (a new file),
@@ -517,11 +589,13 @@ struct Overlay {
     bool removed = false;
     std::optional<Entry> base;
     std::uint64_t size = 0, floor = 0;
-    std::map<std::uint64_t, std::vector<std::byte>> chunks;
+    std::map<std::uint64_t, Piece> chunks;
     // Since the last sync:
     bool dirty = false, reset = false;
     std::set<std::uint64_t> dirty_chunks;
 };
+
+using Overlays = std::map<std::string, Overlay, std::less<>>;
 
 /// An entry's metadata as PutOptions, to put it again as it was.
 sq::cart::PutOptions options_of(const Entry& e) {
@@ -558,23 +632,35 @@ fs::path staging_folder(const fs::path& staging, const fs::path& cartridge) {
     return staging / (name + "-" + readable);
 }
 
+fs::path segment_path(const fs::path& folder, std::uint64_t n) { return folder / std::format("journal.{:08}", n); }
+
 struct File::State {
     State(fs::path p, MountOptions o, sq::cart::Archive a)
         : path(std::move(p)), options(std::move(o)), archive(std::move(a)), cache(options.cache_bytes) {}
+    State(const State&) = delete;
+    State& operator=(const State&) = delete;
 
     fs::path path;
     MountOptions options;
     mutable std::shared_mutex m;
+    std::condition_variable_any changed;  // a commit or a compaction ended
+    std::condition_variable_any wake;     // the commit thread has something to do
     sq::cart::Archive archive;
     Cache cache;
     // A read-write mount:
     std::optional<sq::cart::Writer> writer;
-    Journal journal;
-    std::map<std::string, Overlay, std::less<>> overlays;
+    fs::path folder;
+    std::uint64_t next_segment = 0;
+    Segment journal;                                    // the segment written now
+    std::vector<std::shared_ptr<SegmentFile>> retired;  // older segments the overlays still use
+    Overlays overlays;                                  // changes being made
+    Overlays frozen;                                    // changes being committed
     std::vector<std::pair<std::string, std::string>> renames;  // since the last sync
-    std::uint64_t staged = 0;                                  // bytes in overlay chunks
+    std::uint64_t staged = 0, frozen_bytes = 0, memory = 0;
     std::optional<std::chrono::steady_clock::time_point> first_change;
-    bool writable = false;
+    bool writable = false, committing = false, compacting = false, commit_wanted = false;
+    std::optional<Error> background_error;
+    std::jthread worker;
 
     [[nodiscard]] const sq::cart::Limits& limits() const noexcept { return options.read.limits; }
 
@@ -614,6 +700,14 @@ struct File::State {
         return done;
     }
 
+    static Result<void> read_piece(const Piece& p, std::uint64_t from, std::span<std::byte> out) {
+        if (!p.file) {
+            std::copy_n(p.bytes.begin() + static_cast<std::ptrdiff_t>(from), static_cast<std::ptrdiff_t>(out.size()), out.begin());
+            return {};
+        }
+        return pread_all(p.file->fd, p.at + from, out, p.file->path);
+    }
+
     /// `out` from `at`, as an overlay's base gives it: the base's bytes
     /// below its floor, zeros above (changed chunks aside).
     Result<void> from_base(const Overlay& ov, std::uint64_t at, std::span<std::byte> out) {
@@ -636,7 +730,7 @@ struct File::State {
             const std::uint64_t take = std::min(lo + chunk_size, end) - at;
             auto piece = out.subspan(done, static_cast<std::size_t>(take));
             if (auto c = ov.chunks.find(i); c != ov.chunks.end()) {
-                std::copy_n(c->second.begin() + static_cast<std::ptrdiff_t>(at - lo), static_cast<std::ptrdiff_t>(take), piece.begin());
+                if (auto r = read_piece(c->second, at - lo, piece); !r) return std::unexpected(r.error());
             } else if (auto r = from_base(ov, at, piece); !r) {
                 return std::unexpected(r.error());
             }
@@ -646,22 +740,24 @@ struct File::State {
         return done;
     }
 
-    /// What a path holds now: its overlay, or its committed entry.
+    /// What a path holds now: changes being made, then changes being
+    /// committed, then the cartridge.
     struct Found {
         const Overlay* overlay = nullptr;
         std::optional<Entry> entry;
     };
     Result<Found> find(std::string_view path) const {
-        if (auto it = overlays.find(path); it != overlays.end()) {
-            if (it->second.removed) return fail(Code::not_found, "no such file", std::string(path));
-            return Found{&it->second, std::nullopt};
+        for (const Overlays* gen : {&overlays, &frozen}) {
+            if (auto it = gen->find(path); it != gen->end()) {
+                if (it->second.removed) return fail(Code::not_found, "no such file", std::string(path));
+                return Found{&it->second, std::nullopt};
+            }
         }
         auto e = archive.find(path);
         if (!e) return std::unexpected(e.error());
         return Found{nullptr, std::move(*e)};
     }
 
-    /// The record a commit would write for a path now.
     Result<Entry> stat(std::string_view path) const {
         auto f = find(path);
         if (!f) return std::unexpected(f.error());
@@ -684,10 +780,22 @@ struct File::State {
         return {};
     }
 
+    /// Wait while `path` is being committed, or the cartridge compacted.
+    void wait_free(std::unique_lock<std::shared_mutex>& lock, std::initializer_list<std::string_view> paths) {
+        const auto busy = [&] {
+            if (compacting) return true;
+            if (!committing) return false;
+            return std::ranges::any_of(paths, [&](std::string_view p) { return frozen.contains(p) && !overlays.contains(p); });
+        };
+        while (busy()) changed.wait(lock);
+    }
+
     /// The overlay a change to `path` goes to, made from its committed
     /// entry if there is none. A committed entry without `w` (§4.2) is not
     /// changed.
-    Result<Overlay*> editable(std::string_view path) {
+    Result<Overlay*> editable(std::unique_lock<std::shared_mutex>& lock, std::string_view path) {
+        wait_free(lock, {path});
+        if (auto r = writable_now(); !r) return std::unexpected(r.error());
         if (auto it = overlays.find(path); it != overlays.end()) {
             if (it->second.removed) return fail(Code::not_found, "no such file", std::string(path));
             return &it->second;
@@ -705,15 +813,39 @@ struct File::State {
         if (!first_change) first_change = std::chrono::steady_clock::now();
     }
 
-    /// Chunk `i` of an overlay, its bytes made from the base if it has
-    /// none yet.
+    void drop_piece(const Piece& p) {
+        staged -= p.size();
+        if (!p.file) memory -= p.bytes.size();
+    }
+
+    /// Chunk `i` of an overlay, in memory to be changed: loaded back from
+    /// the journal, or made from the base if it has none yet.
     Result<std::vector<std::byte>*> chunk(Overlay& ov, std::uint64_t i) {
-        if (auto c = ov.chunks.find(i); c != ov.chunks.end()) return &c->second;
+        if (auto c = ov.chunks.find(i); c != ov.chunks.end()) {
+            Piece& p = c->second;
+            if (p.file) {
+                std::vector<std::byte> bytes(p.length);
+                if (auto r = read_piece(p, 0, bytes); !r) return std::unexpected(r.error());
+                p.bytes = std::move(bytes);
+                p.file.reset();
+                memory += p.bytes.size();
+            }
+            return &p.bytes;
+        }
         const std::uint64_t lo = i * chunk_size;
-        std::vector<std::byte> bytes(static_cast<std::size_t>(std::min<std::uint64_t>(chunk_size, ov.size - lo)));
-        if (auto r = from_base(ov, lo, bytes); !r) return std::unexpected(r.error());
-        staged += bytes.size();
-        return &ov.chunks.emplace(i, std::move(bytes)).first->second;
+        Piece p;
+        p.bytes.resize(static_cast<std::size_t>(std::min<std::uint64_t>(chunk_size, ov.size - lo)));
+        if (auto r = from_base(ov, lo, p.bytes); !r) return std::unexpected(r.error());
+        staged += p.bytes.size();
+        memory += p.bytes.size();
+        return &ov.chunks.emplace(i, std::move(p)).first->second.bytes;
+    }
+
+    /// Change a chunk's length in memory, its counts with it.
+    void set_length(std::vector<std::byte>& bytes, std::uint64_t n) {
+        staged += n, memory += n;
+        staged -= bytes.size(), memory -= bytes.size();
+        bytes.resize(static_cast<std::size_t>(n));
     }
 
     Result<void> resize(Overlay& ov, std::uint64_t n) {
@@ -721,10 +853,10 @@ struct File::State {
         if (n > ov.size) {
             if (ov.size > 0) {
                 const std::uint64_t last = (ov.size - 1) / chunk_size;
-                if (auto c = ov.chunks.find(last); c != ov.chunks.end()) {
-                    const auto want = static_cast<std::size_t>(std::min<std::uint64_t>(chunk_size, n - last * chunk_size));
-                    staged += want - c->second.size();
-                    c->second.resize(want);
+                if (ov.chunks.contains(last)) {
+                    auto c = chunk(ov, last);
+                    if (!c) return std::unexpected(c.error());
+                    set_length(**c, std::min<std::uint64_t>(chunk_size, n - last * chunk_size));
                     ov.dirty_chunks.insert(last);
                 }
             }
@@ -734,12 +866,11 @@ struct File::State {
                 const std::uint64_t k = n / chunk_size;
                 auto c = chunk(ov, k);
                 if (!c) return std::unexpected(c.error());
-                staged -= (*c)->size() - (n - k * chunk_size);
-                (*c)->resize(static_cast<std::size_t>(n - k * chunk_size));
+                set_length(**c, n - k * chunk_size);
                 ov.dirty_chunks.insert(k);
             }
             for (auto it = ov.chunks.lower_bound((n + chunk_size - 1) / chunk_size); it != ov.chunks.end();) {
-                staged -= it->second.size();
+                drop_piece(it->second);
                 ov.dirty_chunks.erase(it->first);
                 it = ov.chunks.erase(it);
             }
@@ -773,31 +904,48 @@ struct File::State {
         return {};
     }
 
-    /// Before a change: room for it, committing first where the policy may.
-    Result<void> make_room() {
-        if (staged < options.staging_bytes) return {};
-        if (options.commit == Policy::budget) {
-            auto c = commit();
-            if (!c) return std::unexpected(c.error());
-            return {};
-        }
-        return fail(Code::limit, std::format("{} bytes staged, the most allowed: commit first", staged));
+    [[nodiscard]] bool due() const {
+        return first_change && !overlays.empty() && std::chrono::steady_clock::now() - *first_change >= options.commit_after;
     }
 
-    /// After a change: commit if the budget says so.
+    Result<void> take_background_error() {
+        if (!background_error) return {};
+        Error e = std::move(*background_error);
+        background_error.reset();
+        return std::unexpected(std::move(e));
+    }
+
+    /// Before a change: room for it. Past staging_bytes, a budget Drive
+    /// waits for a commit; any other refuses.
+    Result<void> make_room(std::unique_lock<std::shared_mutex>& lock) {
+        while (staged + frozen_bytes >= options.staging_bytes) {
+            if (auto r = take_background_error(); !r) return r;
+            if (options.commit != Policy::budget || !worker.joinable()) {
+                return fail(Code::limit, std::format("{} bytes staged, the most allowed: commit first", staged + frozen_bytes));
+            }
+            if (!committing) {
+                commit_wanted = true;
+                wake.notify_all();
+            }
+            changed.wait(lock);
+        }
+        return {};
+    }
+
+    /// After a change: past memory_bytes, sync; past the budget, ask the
+    /// commit thread to commit.
     Result<void> after_change() {
-        if (options.commit != Policy::budget) return {};
-        const bool full = staged >= options.commit_bytes;
-        const bool old = first_change && std::chrono::steady_clock::now() - *first_change >= options.commit_after;
-        if (!full && !old) return {};
-        auto c = commit();
-        if (!c) return std::unexpected(c.error());
+        if (memory >= options.memory_bytes) {
+            if (auto r = sync(); !r) return r;
+        }
+        if (options.commit == Policy::budget && worker.joinable() && (staged >= options.commit_bytes || due())) {
+            commit_wanted = true;
+            wake.notify_all();
+        }
         return {};
     }
 
     // ------------------------------------------------- the journal, commits
-
-    [[nodiscard]] bool anything_staged() const { return !overlays.empty(); }
 
     Result<void> sync() {
         if (!writable) return {};
@@ -810,26 +958,37 @@ struct File::State {
             put_s(p, to);
             journal.add(Rec::rename, p);
         }
-        for (const auto& [path, ov] : overlays) {
+        std::vector<std::tuple<Piece*, std::uint64_t>> moved;  // pieces that will live in the journal
+        for (auto& [path, ov] : overlays) {
             if (!ov.dirty) continue;
             p.clear();
             put_s(p, path);
-            put_u(p, (ov.removed ? 1u : 0u) | (ov.reset ? 4u : 0u) | (ov.base ? 2u : 0u), 1);
+            put_u(p, (ov.removed ? 1u : 0u) | (ov.base ? 2u : 0u) | (ov.reset ? 4u : 0u), 1);
             put_s(p, ov.base ? std::string_view(ov.base->path) : std::string_view{});
             put_u(p, ov.size, 8);
             put_u(p, ov.floor, 8);
             journal.add(Rec::entry, p);
             for (const std::uint64_t i : ov.dirty_chunks) {
                 auto c = ov.chunks.find(i);
-                if (c == ov.chunks.end()) continue;
+                if (c == ov.chunks.end() || c->second.file) continue;
                 p.clear();
                 put_s(p, path);
                 put_u(p, i, 8);
-                p.insert(p.end(), c->second.begin(), c->second.end());
-                journal.add(Rec::chunk, p);
+                const std::size_t head = p.size();
+                p.insert(p.end(), c->second.bytes.begin(), c->second.bytes.end());
+                const std::uint64_t at = journal.add(Rec::chunk, p) + head;
+                moved.emplace_back(&c->second, at);
             }
         }
         if (auto r = journal.flush(options.write.sync); !r) return r;
+        // Synced chunks leave memory: they are read back from the journal.
+        for (auto [piece, at] : moved) {
+            memory -= piece->bytes.size();
+            piece->length = static_cast<std::uint32_t>(piece->bytes.size());
+            piece->at = at;
+            piece->file = journal.file();
+            std::vector<std::byte>{}.swap(piece->bytes);
+        }
         renames.clear();
         for (auto& [path, ov] : overlays) {
             ov.dirty = ov.reset = false;
@@ -838,17 +997,23 @@ struct File::State {
         return {};
     }
 
-    /// Apply a journal's records to the overlays, as replay after a crash.
-    Result<void> replay(const std::vector<Record>& records) {
-        const auto broken = [&](std::string_view why) { return fail(Code::conflict, std::format("{}: {}", journal.path().string(), why)); };
-        for (const Record& r : records) {
+    /// Apply a segment's records to the overlays, as replay after a crash.
+    Result<void> replay(const SegmentContents& seg) {
+        const auto broken = [&](std::string_view why) { return fail(Code::conflict, std::format("{}: {}", seg.path.string(), why)); };
+        for (const Record& r : seg.records) {
             Cursor c{r.payload};
             if (r.type == Rec::rename) {
                 const std::string from = c.s(), to = c.s();
                 if (!c.ok) return broken("a rename record that does not parse");
-                auto ov = editable_replay(from);
-                if (!ov) return broken(std::format("a rename of {}, which is not there", from));
-                Overlay moved = std::move(**ov);
+                Overlay moved;
+                if (auto it = overlays.find(from); it != overlays.end() && !it->second.removed) {
+                    moved = std::move(it->second);
+                } else if (auto e = archive.find(from); e && it == overlays.end()) {
+                    moved.size = moved.floor = e->size;
+                    moved.base = std::move(*e);
+                } else {
+                    return broken(std::format("a rename of {}, which is not there", from));
+                }
                 overlays.insert_or_assign(to, std::move(moved));
                 Overlay gone;
                 gone.removed = true;
@@ -874,39 +1039,35 @@ struct File::State {
             } else if (r.type == Rec::chunk) {
                 const std::string path = c.s();
                 const std::uint64_t i = c.u(8);
-                const auto bytes = c.rest();
                 auto it = overlays.find(path);
                 if (!c.ok || it == overlays.end() || it->second.removed) return broken("a chunk record for no file");
-                it->second.chunks.insert_or_assign(i, std::vector<std::byte>(bytes.begin(), bytes.end()));
+                Piece p;
+                p.file = seg.file;
+                p.at = r.data_at;
+                p.length = r.data_length;
+                it->second.chunks.insert_or_assign(i, std::move(p));
             }
         }
-        staged = 0;
-        for (const auto& [path, ov] : overlays) {
-            for (const auto& [i, bytes] : ov.chunks) staged += bytes.size();
-        }
-        if (!overlays.empty()) note_change();
         return {};
     }
-    Result<Overlay*> editable_replay(std::string_view path) {
-        if (auto it = overlays.find(path); it != overlays.end()) {
-            if (it->second.removed) return fail(Code::not_found, "removed");
-            return &it->second;
+
+    void recount() {
+        staged = memory = 0;
+        for (const auto& [path, ov] : overlays) {
+            for (const auto& [i, p] : ov.chunks) {
+                staged += p.size();
+                if (!p.file) memory += p.bytes.size();
+            }
         }
-        auto e = archive.find(path);
-        if (!e) return std::unexpected(e.error());
-        Overlay ov;
-        ov.size = ov.floor = e->size;
-        ov.base = std::move(*e);
-        return &overlays.emplace(std::string(path), std::move(ov)).first->second;
     }
 
-    /// Hand the overlays to the writer as one commit's changes.
-    Result<std::vector<fs::path>> stage(sq::cart::Writer& w) {
+    /// Hand a generation of changes to the writer as one commit's.
+    Result<std::vector<fs::path>> stage(sq::cart::Writer& w, Overlays& gen) {
         std::vector<fs::path> temporaries;
         // Renames, through temporary names, so that any permutation (a swap) works.
         std::vector<std::pair<std::string, std::string>> moves;
         std::set<std::string, std::less<>> sources;
-        for (const auto& [path, ov] : overlays) {
+        for (const auto& [path, ov] : gen) {
             if (!ov.removed && ov.base && ov.base->path != path) {
                 moves.emplace_back(ov.base->path, path);
                 sources.insert(ov.base->path);
@@ -924,13 +1085,14 @@ struct File::State {
             if (auto r = w.rename(parked[k], moves[k].second); !r) return std::unexpected(r.error());
         }
         // Removals of what was committed and is not moved.
-        for (const auto& [path, ov] : overlays) {
+        for (const auto& [path, ov] : gen) {
             if (ov.removed && !sources.contains(path) && archive.find(path).has_value()) {
                 if (auto r = w.remove(path); !r) return std::unexpected(r.error());
             }
         }
         // Contents.
-        for (auto& [path, ov] : overlays) {
+        std::vector<std::byte> buf(static_cast<std::size_t>(chunk_size));
+        for (auto& [path, ov] : gen) {
             if (ov.removed) continue;
             const bool cut = ov.base && ov.floor < ov.base->size;
             const bool changed = !ov.base || cut || ov.size != ov.base->size || !ov.chunks.empty();
@@ -943,13 +1105,18 @@ struct File::State {
                 if (ov.size != (cut ? ov.floor : ov.base->size)) {
                     if (auto r = w.resize(path, ov.size); !r) return std::unexpected(r.error());
                 }
-                for (const auto& [i, bytes] : ov.chunks) {
+                for (const auto& [i, piece] : ov.chunks) {
+                    const auto bytes = std::span(buf).first(static_cast<std::size_t>(piece.size()));
+                    if (auto r = read_piece(piece, 0, bytes); !r) return std::unexpected(r.error());
                     if (auto r = w.put_range(path, i * chunk_size, bytes); !r) return std::unexpected(r.error());
                 }
                 continue;
             }
-            // Anything else is put whole: in memory up to 64 MiB, else from a file, chunked.
+            // Anything else is put whole: from memory up to 64 MiB, else from
+            // a file. A file the Drive made is stored chunked, so the next
+            // commit writes only the chunks it changes.
             auto options = ov.base ? options_of(*ov.base) : sq::cart::PutOptions{.flags = sq::cart::flag::r | sq::cart::flag::w};
+            if (!ov.base && ov.size > 0) options.store = sq::cart::Store::chunked;
             if (ov.size <= limits().max_unchunked_size) {
                 std::vector<std::byte> content(static_cast<std::size_t>(ov.size));
                 auto got = read_overlay(ov, 0, content);
@@ -957,10 +1124,9 @@ struct File::State {
                 if (auto r = w.put(path, content, options); !r) return std::unexpected(r.error());
                 continue;
             }
-            const fs::path tmp = journal.path().parent_path() / std::format("commit-{}.tmp", temporaries.size());
+            const fs::path tmp = folder / std::format("commit-{}.tmp", temporaries.size());
             temporaries.push_back(tmp);
             std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-            std::vector<std::byte> buf(static_cast<std::size_t>(chunk_size));
             for (std::uint64_t at = 0; at < ov.size; at += chunk_size) {
                 auto got = read_overlay(ov, at, buf);
                 if (!got) return std::unexpected(got.error());
@@ -974,24 +1140,14 @@ struct File::State {
         return temporaries;
     }
 
-    Result<sq::cart::Commit> commit() {
-        if (!writable) {
-            if (auto r = writable_now(); !r) return std::unexpected(r.error());
-        }
-        if (!anything_staged()) return archive.commit();
-        if (auto r = sync(); !r) return std::unexpected(r.error());
-        // Write down the commit's time first: after a crash, a commit with
-        // this time on top of the base is this one.
-        const std::int64_t time = std::max(now_ms(), archive.commit().time + 1);
-        std::vector<std::byte> p;
-        put_u(p, static_cast<std::uint64_t>(time), 8);
-        journal.add(Rec::committing, p);
-        if (auto r = journal.flush(options.write.sync); !r) return std::unexpected(r.error());
+    /// The commit itself, with the lock not held: only the thread with
+    /// `committing` set uses the writer and the frozen changes.
+    Result<sq::cart::Commit> write_commit(std::int64_t time) {
         crash_point("before_commit");
-        auto temporaries = stage(*writer);
+        auto temporaries = stage(*writer, frozen);
         const auto clean = [&] {
+            std::error_code ec;
             if (temporaries) {
-                std::error_code ec;
                 for (const auto& t : *temporaries) fs::remove(t, ec);
             }
         };
@@ -1007,33 +1163,156 @@ struct File::State {
             return std::unexpected(c.error());
         }
         crash_point("after_commit");
-        auto fresh = Journal::create(journal.path(), c->sequence, options.write.sync);
-        if (!fresh) return std::unexpected(fresh.error());
-        journal = std::move(*fresh);
-        auto a = sq::cart::Archive::open(path, options.read);
-        if (!a) return std::unexpected(a.error());
-        archive = std::move(*a);
-        overlays.clear();
-        renames.clear();
-        staged = 0;
-        first_change.reset();
-        return *c;
+        return c;
     }
 
-    Result<void> unmount() {
-        if (!writable) return {};
-        Result<void> r;
-        if (options.commit == Policy::explicit_only) {
-            r = sync();
-        } else if (auto c = commit(); !c) {
-            r = std::unexpected(c.error());
+    /// Commit what is staged: freeze it, start a new segment for the writes
+    /// that go on meanwhile, commit without the lock, then take the new
+    /// state (or, on failure, give the changes back).
+    Result<sq::cart::Commit> commit(std::unique_lock<std::shared_mutex>& lock) {
+        while (committing || compacting) changed.wait(lock);
+        if (auto r = writable_now(); !r) return std::unexpected(r.error());
+        if (overlays.empty()) return archive.commit();
+        if (auto r = sync(); !r) return std::unexpected(r.error());
+        const std::uint64_t base = archive.commit().sequence;
+        auto next = Segment::create(segment_path(folder, next_segment), base, options.write.sync);
+        if (!next) return std::unexpected(next.error());
+        ++next_segment;
+        Segment old = std::exchange(journal, std::move(*next));
+        auto covered = std::exchange(retired, {});
+        frozen = std::exchange(overlays, {});
+        frozen_bytes = std::exchange(staged, 0);
+        memory = 0;
+        first_change.reset();
+        committing = true;
+        // Write the commit's time down first: after a crash, a commit with
+        // this time on top of the base is this one.
+        const std::int64_t time = std::max(now_ms(), archive.commit().time + 1);
+        std::vector<std::byte> p;
+        put_u(p, static_cast<std::uint64_t>(time), 8);
+        old.add(Rec::committing, p);
+        auto flushed = old.flush(options.write.sync);
+        lock.unlock();
+        Result<sq::cart::Commit> c = flushed ? write_commit(time) : std::unexpected(flushed.error());
+        const bool landed = c.has_value();
+        std::optional<sq::cart::Archive> fresh;
+        if (c) {
+            auto a = sq::cart::Archive::open(path, options.read);
+            if (a) fresh = std::move(*a);
+            else c = std::unexpected(a.error());
         }
-        if (!r) {
-            static_cast<void>(sync());  // keep what can be kept for the next mount
+        lock.lock();
+        if (!landed) {
+            // Not committed: the changes come back (no write touched their
+            // paths meanwhile), their segments with them.
+            if (flushed) {
+                old.add(Rec::aborted, {});
+                static_cast<void>(old.flush(options.write.sync));
+            }
+            for (auto& [path, ov] : frozen) overlays.insert_or_assign(path, std::move(ov));
+            frozen.clear();
+            retired = std::move(covered);
+            retired.push_back(old.file());
+            recount();
+            note_change();
+        } else if (!fresh) {
+            // Committed, but the cartridge does not read back: stop writing.
+            writable = false;
+        } else {
+            archive = std::move(*fresh);
+            frozen.clear();
+            std::error_code ec;
+            fs::remove(old.file()->path, ec);
+            for (const auto& f : covered) fs::remove(f->path, ec);
+            if (auto r = journal.rebase(c->sequence, options.write.sync); !r) c = std::unexpected(r.error());
+        }
+        frozen_bytes = 0;
+        committing = false;
+        changed.notify_all();
+        if (c && overlays.empty()) maybe_compact(lock);
+        return c;
+    }
+
+    /// After a commit, with nothing staged: compact if enough of the file
+    /// is unreachable. Writers wait; readers go on with the old file.
+    void maybe_compact(std::unique_lock<std::shared_mutex>& lock) {
+        if (options.compact_at <= 0 || !writable) return;
+        auto live = archive.entries();
+        if (!live) return;
+        std::uint64_t used = 8192;
+        for (const Entry& e : *live) {
+            used += e.stored_size;
+            if (e.codec == sq::cart::Codec::chunked) {
+                auto cs = archive.chunks(e);
+                if (!cs) return;
+                for (const auto& ch : *cs) used += ch.stored_size;
+            }
+        }
+        const std::uint64_t size = archive.file_size();
+        const std::uint64_t dead = size > used ? size - used : 0;
+        if (dead < options.compact_min_bytes || static_cast<double>(dead) < options.compact_at * static_cast<double>(size)) return;
+        compacting = true;
+        lock.unlock();
+        auto c = writer->compact();
+        std::optional<sq::cart::Archive> fresh;
+        if (c) {
+            if (auto a = sq::cart::Archive::open(path, options.read)) fresh = std::move(*a);
+        }
+        lock.lock();
+        if (!c) {
+            background_error = c.error();
+        } else if (!fresh) {
+            writable = false;
+        } else {
+            archive = std::move(*fresh);
+            if (auto r = journal.rebase(c->sequence, options.write.sync); !r) background_error = r.error();
+        }
+        compacting = false;
+        changed.notify_all();
+    }
+
+    /// The commit thread of a budget Drive: commits when asked, or when the
+    /// oldest change is commit_after old.
+    void run(std::stop_token stop) {
+        std::unique_lock lock(m);
+        while (!stop.stop_requested()) {
+            const auto ready = [&] { return commit_wanted || due(); };
+            if (first_change) wake.wait_until(lock, stop, *first_change + options.commit_after, ready);
+            else wake.wait(lock, stop, ready);
+            if (stop.stop_requested()) break;
+            if (!ready()) continue;
+            commit_wanted = false;
+            if (auto c = commit(lock); !c) {
+                background_error = c.error();
+                changed.notify_all();
+                if (!writable) break;
+            }
+        }
+    }
+
+    Result<void> unmount(std::unique_lock<std::shared_mutex>& lock) {
+        if (!writable && !worker.joinable()) return {};
+        if (worker.joinable()) {
+            worker.request_stop();
+            wake.notify_all();
+            lock.unlock();
+            worker.join();
+            lock.lock();
+        }
+        while (committing || compacting) changed.wait(lock);
+        Result<void> r = take_background_error();
+        if (writable) {
+            if (options.commit == Policy::explicit_only) {
+                if (auto s = sync(); !s && r) r = s;
+            } else if (auto c = commit(lock); !c) {
+                if (r) r = std::unexpected(c.error());
+                static_cast<void>(sync());  // keep what can be kept for the next mount
+            }
         }
         writable = false;
         writer.reset();
-        journal = Journal{};
+        journal = Segment{};
+        retired.clear();
         return r;
     }
 };
@@ -1065,8 +1344,8 @@ Result<std::size_t> File::read(std::uint64_t offset, std::span<std::byte> out) c
 Result<void> File::write(std::uint64_t offset, std::span<const std::byte> bytes) {
     std::unique_lock lock(state_->m);
     if (auto r = state_->writable_now(); !r) return r;
-    if (auto r = state_->make_room(); !r) return r;
-    auto ov = state_->editable(path_);
+    if (auto r = state_->make_room(lock); !r) return r;
+    auto ov = state_->editable(lock, path_);
     if (!ov) return std::unexpected(ov.error());
     if (auto r = state_->write(**ov, offset, bytes); !r) return std::unexpected(Error{r.error().code, r.error().message, path_});
     return state_->after_change();
@@ -1075,8 +1354,8 @@ Result<void> File::write(std::uint64_t offset, std::span<const std::byte> bytes)
 Result<void> File::resize(std::uint64_t size) {
     std::unique_lock lock(state_->m);
     if (auto r = state_->writable_now(); !r) return r;
-    if (auto r = state_->make_room(); !r) return r;
-    auto ov = state_->editable(path_);
+    if (auto r = state_->make_room(lock); !r) return r;
+    auto ov = state_->editable(lock, path_);
     if (!ov) return std::unexpected(ov.error());
     if (auto r = state_->resize(**ov, size); !r) return std::unexpected(Error{r.error().code, r.error().message, path_});
     return state_->after_change();
@@ -1088,6 +1367,20 @@ Result<void> File::sync() {
 }
 
 // ------------------------------------------------------------------ Drive
+
+namespace {
+
+/// Rewrite a segment file's header to apply on `base`.
+Result<void> rebase_file(const fs::path& path, std::uint64_t base, bool sync) {
+    const int fd = ::open(path.c_str(), O_WRONLY | O_CLOEXEC);
+    if (fd < 0) return fail(Code::io, errno_text("cannot open", path));
+    auto r = pwrite_all(fd, 0, header_bytes(base), path);
+    if (r && sync && ::fsync(fd) != 0) r = fail(Code::io, errno_text("cannot flush", path));
+    ::close(fd);
+    return r;
+}
+
+}  // namespace
 
 Result<Drive> Drive::mount(const fs::path& cartridge, MountOptions options) {
     options.write.limits = options.read.limits;
@@ -1105,52 +1398,81 @@ Result<Drive> Drive::mount(const fs::path& cartridge, MountOptions options) {
     std::error_code ec;
     fs::create_directories(folder, ec);
     if (ec) return fail(Code::io, std::format("cannot create {}: {}", folder.string(), ec.message()));
-    const fs::path journal = folder / "journal";
+    const bool sync = options.write.sync;
     const std::uint64_t head = archive->commit().sequence;
     const std::int64_t head_time = archive->commit().time;
-    const bool sync = options.write.sync;
     auto state = std::make_shared<File::State>(cartridge, std::move(options), std::move(*archive));
     state->writer = std::move(*writer);
-    if (!fs::exists(journal, ec)) {
-        auto j = Journal::create(journal, head, sync);
-        if (!j) return std::unexpected(j.error());
-        state->journal = std::move(*j);
-    } else {
-        auto contents = Journal::read(journal);
-        if (!contents) return std::unexpected(contents.error());
-        if (contents->base == head) {
-            // Not committed: replay what was synced, drop a torn tail.
-            auto j = Journal::append_to(journal, contents->end);
-            if (!j) return std::unexpected(j.error());
-            state->journal = std::move(*j);
-            if (auto r = state->replay(contents->records); !r) return std::unexpected(r.error());
-        } else if (contents->committing && head == contents->base + 1 && head_time == *contents->committing) {
-            // Its commit landed; only the journal did not hear.
-            auto j = Journal::create(journal, head, sync);
-            if (!j) return std::unexpected(j.error());
-            state->journal = std::move(*j);
-        } else if (state->options.discard_journal) {
-            fs::path aside = journal;
-            aside += std::format(".conflict-{}", now_ms());
-            fs::rename(journal, aside, ec);
-            if (ec) return fail(Code::io, std::format("cannot set {} aside: {}", journal.string(), ec.message()));
-            auto j = Journal::create(journal, head, sync);
-            if (!j) return std::unexpected(j.error());
-            state->journal = std::move(*j);
-        } else {
-            return fail(Code::conflict, std::format("{} holds changes made on commit {}, and the cartridge is at commit {}: "
-                                                    "another writer committed since (mount with discard_journal to set them aside)",
-                                                    journal.string(), contents->base, head));
-        }
+    state->folder = folder;
+
+    // The segments, oldest first (a journal from before segments is the first).
+    if (fs::exists(folder / "journal", ec)) fs::rename(folder / "journal", segment_path(folder, 0), ec);
+    std::vector<std::uint64_t> numbers;
+    for (const auto& e : fs::directory_iterator(folder, ec)) {
+        const std::string name = e.path().filename().string();
+        if (name.size() != 16 || !name.starts_with("journal.")) continue;
+        std::uint64_t n = 0;
+        if (std::from_chars(name.data() + 8, name.data() + 16, n).ec == std::errc{}) numbers.push_back(n);
     }
+    std::ranges::sort(numbers);
+    std::vector<SegmentContents> segments;
+    for (const std::uint64_t n : numbers) {
+        auto s = Segment::read(segment_path(folder, n), n);
+        if (!s) return std::unexpected(s.error());
+        state->next_segment = n + 1;
+        if (s->records.empty() && !s->committing) {
+            fs::remove(s->path, ec);  // nothing in it
+            continue;
+        }
+        segments.push_back(std::move(*s));
+    }
+    // A commit that landed covers its segment and every one before it.
+    std::size_t first = 0;
+    for (std::size_t i = 0; i < segments.size(); ++i) {
+        const auto& s = segments[i];
+        if (s.committing && head == s.base + 1 && head_time == *s.committing) first = i + 1;
+    }
+    for (std::size_t i = 0; i < first; ++i) fs::remove(segments[i].path, ec);
+    segments.erase(segments.begin(), segments.begin() + static_cast<std::ptrdiff_t>(first));
+    const bool fits = std::ranges::all_of(segments, [&](const SegmentContents& s) { return s.base == head || (first > 0 && s.base + 1 == head); });
+    if (!fits) {
+        if (!state->options.discard_journal) {
+            return fail(Code::conflict, std::format("{} holds changes made on commit {}, and the cartridge is at commit {}: another writer "
+                                                    "committed since (mount with discard_journal to set them aside)",
+                                                    folder.string(), segments.front().base, head));
+        }
+        const auto when = now_ms();
+        for (const auto& s : segments) {
+            fs::path aside = folder / std::format("journal.conflict-{}.{}", when, s.number);
+            fs::rename(s.path, aside, ec);
+            if (ec) return fail(Code::io, std::format("cannot set {} aside: {}", s.path.string(), ec.message()));
+        }
+        segments.clear();
+    }
+    for (const auto& s : segments) {
+        if (auto r = state->replay(s); !r) return std::unexpected(r.error());
+        if (s.base != head) {
+            if (auto r = rebase_file(s.path, head, sync); !r) return std::unexpected(r.error());
+        }
+        state->retired.push_back(s.file);
+    }
+    state->recount();
+    if (!state->overlays.empty()) state->note_change();
+    auto active = Segment::create(segment_path(folder, state->next_segment), head, sync);
+    if (!active) return std::unexpected(active.error());
+    ++state->next_segment;
+    state->journal = std::move(*active);
     state->writable = true;
+    if (state->options.commit == Policy::budget) {
+        state->worker = std::jthread([raw = state.get()](std::stop_token stop) { raw->run(std::move(stop)); });
+    }
     return Drive(std::move(state));
 }
 
 Drive::~Drive() {
     if (state_) {
         std::unique_lock lock(state_->m);
-        static_cast<void>(state_->unmount());
+        static_cast<void>(state_->unmount(lock));
     }
 }
 
@@ -1162,24 +1484,27 @@ Result<File> Drive::open(std::string_view path, unsigned how) const {
         return File(state_, std::string(path), std::move(*e));
     }
     std::unique_lock lock(state_->m);
-    if (how != mode::read) {
-        if (auto r = state_->writable_now(); !r) return std::unexpected(r.error());
+    if (how == mode::read) {
+        if (auto f = state_->find(path); !f) return std::unexpected(f.error());
+        return File(state_, std::string(path), std::nullopt);
     }
+    if (auto r = state_->writable_now(); !r) return std::unexpected(r.error());
+    state_->wait_free(lock, {path});
     auto found = state_->find(path);
     if (!found) {
         if (found.error().code != Code::not_found || !(how & mode::create)) return std::unexpected(found.error());
         if (auto problem = sq::cart::path_problem(path, state_->limits().max_path_bytes)) return fail(Code::path, *problem, std::string(path));
-        if (path == "SQ-INF/manifest.json" || path.starts_with("SQ-INF/dictionaries/")) return fail(Code::path, "the Drive does not write the manifest or dictionaries", std::string(path));
+        if (path.starts_with("SQ-INF/")) return fail(Code::path, "the Drive does not write in SQ-INF/", std::string(path));
         Overlay ov;
         ov.reset = ov.dirty = true;
         state_->overlays.insert_or_assign(std::string(path), std::move(ov));
         state_->note_change();
     } else if (how & mode::truncate) {
-        auto ov = state_->editable(path);
+        auto ov = state_->editable(lock, path);
         if (!ov) return std::unexpected(ov.error());
         if (auto r = state_->resize(**ov, 0); !r) return std::unexpected(r.error());
-    } else if (how & mode::write) {
-        if (auto ov = state_->editable(path); !ov) return std::unexpected(ov.error());  // refuses one without w
+    } else {
+        if (auto ov = state_->editable(lock, path); !ov) return std::unexpected(ov.error());  // refuses one without w
     }
     return File(state_, std::string(path), std::nullopt);
 }
@@ -1196,10 +1521,12 @@ Result<std::vector<Entry>> Drive::list(std::string_view prefix) const {
     std::map<std::string, Entry, std::less<>> all;
     const auto first = std::ranges::lower_bound(*live, prefix, {}, [](const Entry& e) -> std::string_view { return e.path; });
     for (auto it = first; it != live->end() && it->path.starts_with(prefix); ++it) all.emplace(it->path, *it);
-    for (const auto& [path, ov] : state_->overlays) {
-        if (!path.starts_with(prefix)) continue;
-        if (ov.removed) all.erase(path);
-        else all.insert_or_assign(path, File::State::as_entry(path, ov));
+    for (const Overlays* gen : {&state_->frozen, &state_->overlays}) {
+        for (const auto& [path, ov] : *gen) {
+            if (!path.starts_with(prefix)) continue;
+            if (ov.removed) all.erase(path);
+            else all.insert_or_assign(path, File::State::as_entry(path, ov));
+        }
     }
     std::vector<Entry> out;
     for (auto& [path, e] : all) out.push_back(std::move(e));
@@ -1209,9 +1536,9 @@ Result<std::vector<Entry>> Drive::list(std::string_view prefix) const {
 Result<void> Drive::remove(std::string_view path) {
     std::unique_lock lock(state_->m);
     if (auto r = state_->writable_now(); !r) return r;
-    auto ov = state_->editable(path);
+    auto ov = state_->editable(lock, path);
     if (!ov) return std::unexpected(ov.error());
-    for (const auto& [i, bytes] : (*ov)->chunks) state_->staged -= bytes.size();
+    for (const auto& [i, p] : (*ov)->chunks) state_->drop_piece(p);
     Overlay gone;
     gone.removed = gone.reset = gone.dirty = true;
     **ov = std::move(gone);
@@ -1225,9 +1552,10 @@ Result<void> Drive::rename(std::string_view from, std::string_view to) {
     if (from == to) return state_->find(from).has_value() ? Result<void>{} : fail(Code::not_found, "no such file", std::string(from));
     if (auto problem = sq::cart::path_problem(to, state_->limits().max_path_bytes)) return fail(Code::path, *problem, std::string(to));
     for (std::string_view p : {from, to}) {
-        if (p == "SQ-INF/manifest.json" || p.starts_with("SQ-INF/")) return fail(Code::path, "the Drive does not move files in SQ-INF/", std::string(p));
+        if (p.starts_with("SQ-INF/")) return fail(Code::path, "the Drive does not move files in SQ-INF/", std::string(p));
     }
-    auto source = state_->editable(from);
+    state_->wait_free(lock, {from, to});
+    auto source = state_->editable(lock, from);
     if (!source) return std::unexpected(source.error());
     if (auto target = state_->find(to); target && !target->overlay && !(target->entry->flags & sq::cart::flag::w)) {
         return fail(Code::unsupported, "not writable: its entry has no w flag (§4.2)", std::string(to));
@@ -1235,7 +1563,7 @@ Result<void> Drive::rename(std::string_view from, std::string_view to) {
     Overlay moved = std::move(**source);
     moved.dirty = true;
     if (auto old = state_->overlays.find(to); old != state_->overlays.end()) {
-        for (const auto& [i, bytes] : old->second.chunks) state_->staged -= bytes.size();
+        for (const auto& [i, p] : old->second.chunks) state_->drop_piece(p);
     }
     Overlay gone;
     gone.removed = gone.reset = gone.dirty = true;
@@ -1253,12 +1581,19 @@ Result<void> Drive::sync() {
 
 Result<sq::cart::Commit> Drive::commit() {
     std::unique_lock lock(state_->m);
-    return state_->commit();
+    if (auto r = state_->take_background_error(); !r) return std::unexpected(r.error());
+    return state_->commit(lock);
+}
+
+Result<void> Drive::wait() {
+    std::unique_lock lock(state_->m);
+    while (state_->committing || state_->compacting || state_->commit_wanted) state_->changed.wait(lock);
+    return state_->take_background_error();
 }
 
 Result<void> Drive::unmount() {
     std::unique_lock lock(state_->m);
-    return state_->unmount();
+    return state_->unmount(lock);
 }
 
 sq::cart::Commit Drive::head() const {
@@ -1268,11 +1603,15 @@ sq::cart::Commit Drive::head() const {
 const fs::path& Drive::path() const noexcept { return state_->path; }
 std::uint64_t Drive::staged_bytes() const {
     std::shared_lock lock(state_->m);
-    return state_->staged;
+    return state_->staged + state_->frozen_bytes;
+}
+std::uint64_t Drive::memory_bytes() const {
+    std::shared_lock lock(state_->m);
+    return state_->memory;
 }
 fs::path Drive::journal_path() const {
     std::shared_lock lock(state_->m);
-    return state_->journal.path();
+    return state_->journal.file() ? state_->journal.file()->path : fs::path{};
 }
 CacheStats Drive::cache_stats() const { return state_->cache.stats(); }
 void Drive::drop_cache() { state_->cache.clear(); }

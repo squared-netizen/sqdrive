@@ -1,6 +1,6 @@
 # sqcart's 3.0 library, copied by tools/vendor_sqcart.sh.
 # Do not edit: change it in sqcart, then copy it again.
-from: sqcart e84d890d07bb8b39191eb65994800b12d7a95d73
+from: sqcart 6dc7a0a1831160f618908ef5a85fbc248cdb1d6d
 copied: 2026-11-19
 05d8449c7eda2c00825a8e1137be920ee804adcbcc127954c403b0a8620cfcf8  v3/Makefile
 594158a51feeee8515732fac50dbdc2d8faf145b29d7a05fb445af7a294533fb  v3/src/archive.cppm
