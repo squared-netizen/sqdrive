@@ -36,16 +36,16 @@ all: $(BUILD)/libsqdrive.a $(BUILD)/sqdrive $(TESTS)
 $(CART_OUT) &: $(wildcard $(CART_DIR)/src/*) $(CART_DIR)/Makefile
 	$(MAKE) -C $(CART_DIR) CXX=$(CXX) BUILD=$(CART) OPT="$(OPT)" $(CART_OUT)
 
-$(BUILD)/pcm/sq.drive.pcm $(BUILD)/obj/drive.o &: src/drive.cppm $(CART)/pcm/sq.cart.pcm
+$(BUILD)/pcm/sq.drive.pcm $(BUILD)/obj/drive.o &: src/drive.cppm $(CART)/pcm/sq.cart.pcm $(CART)/pcm/sq.cart.write.pcm
 	@mkdir -p $(BUILD)/pcm $(BUILD)/obj
 	$(CXX) $(CXXFLAGS) -c $< -fmodule-output=$(BUILD)/pcm/sq.drive.pcm -o $(BUILD)/obj/drive.o
 
 $(BUILD)/libsqdrive.a: $(BUILD)/obj/drive.o
 	ar rcs $@ $^
 
-# The tool reads only, so it links no compressor.
-$(BUILD)/sqdrive: tools/sqdrive.cpp $(BUILD)/pcm/sq.drive.pcm $(BUILD)/libsqdrive.a $(READ_LIBS)
-	$(CXX) $(CXXFLAGS) $< $(BUILD)/libsqdrive.a $(READ_LIBS) $(LDFLAGS) -o $@
+# The tool writes too (through sq.cart.write).
+$(BUILD)/sqdrive: tools/sqdrive.cpp $(BUILD)/pcm/sq.drive.pcm $(BUILD)/libsqdrive.a $(WRITE_LIBS)
+	$(CXX) $(CXXFLAGS) $< $(BUILD)/libsqdrive.a $(WRITE_LIBS) $(LDFLAGS) -o $@
 
 # The tests write cartridges with sq.cart.write.
 $(BUILD)/test_%: tests/test_%.cpp $(BUILD)/pcm/sq.drive.pcm $(BUILD)/libsqdrive.a $(WRITE_LIBS) $(CART)/pcm/sq.cart.write.pcm

@@ -1,6 +1,6 @@
 # sqcart's 3.0 library, copied by tools/vendor_sqcart.sh.
 # Do not edit: change it in sqcart, then copy it again.
-from: sqcart 3d1a889a2e7b9b884d990ee22b06829bd8af6543
+from: sqcart e84d890d07bb8b39191eb65994800b12d7a95d73
 copied: 2026-11-19
 05d8449c7eda2c00825a8e1137be920ee804adcbcc127954c403b0a8620cfcf8  v3/Makefile
 594158a51feeee8515732fac50dbdc2d8faf145b29d7a05fb445af7a294533fb  v3/src/archive.cppm
@@ -14,5 +14,5 @@ ae2ed6e3737ac01c52bda5682ad90fcc682769247f7b671e20b9dc066d6652b6  v3/src/fold.cp
 926f2dd4a8b98d050780396b1ee5758d0411ff2514e3f9ca41994c0015df85fa  v3/src/nfc.inc
 f337afb6daf177f74fdbf0e5014afc5e1570382f6e23501caa1a6c847b83a3aa  v3/src/sha256.cppm
 210e338ca813c8d23d6ced05301347c76b598830d949aa057a5e829661af870a  v3/src/sq.cart.cppm
-1d31f9a567001f84856fa313129215c56aae966739d8fe696c2a0701f578e201  v3/src/write.cppm
+dc9053d3676bb8a25b2e60e5cac01d0346ce2b33d827e7929f0bd1448c69fe62  v3/src/write.cppm
 c9a9b46ada3398803d6ef70d220fc68d2bb6cc8668460cee6102f07146825cf8  v3/src/zstd.cppm

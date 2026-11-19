@@ -656,6 +656,12 @@ public:
     /// Sign the commits this writer makes (§9.3).
     void sign_with(SigningKey key) { keys_.push_back(std::move(key)); }
 
+    /// The time the next commits record, in milliseconds since the epoch
+    /// (§3.10); nullopt: SOURCE_DATE_EPOCH when set, else now. A caller
+    /// that must know its commit after a crash (the Drive's journal) sets
+    /// a time it wrote down first.
+    void set_commit_time(std::optional<std::int64_t> ms) noexcept { options_.commit_time = ms; }
+
     [[nodiscard]] bool pending() const noexcept { return !staged_.empty(); }
 
     /// Commit what is staged (§10.3). Returns the new commit.
