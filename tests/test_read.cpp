@@ -68,7 +68,11 @@ int main() {
     auto drive = Drive::mount(cart, {.cache_bytes = 3 * mib});
     check(drive.has_value(), "mount read-only");
     if (!drive) return 1;
-    check(!Drive::mount(cart, {.access = Access::read_write}), "a writable mount is refused until phase 3");
+    {
+        auto w = drive->open("text/fox.txt", mode::write);
+        check(!w && w.error().code == Code::unsupported, "a read-only mount refuses to open for writing");
+        check(!drive->remove("text/fox.txt") && !drive->rename("text/fox.txt", "x"), "and to remove or rename");
+    }
     check(!Drive::mount(dir / "missing.sq"), "a missing cartridge is refused");
 
     // list, stat, open.

@@ -7,7 +7,17 @@
 //   sqdrive cat CART PATH [OFFSET [N]] bytes, verified, to stdout
 //   sqdrive bench CART PATH            sequential and random reads, cold and warm
 //
-// Read-only for now; write, sync, commit and recover come with phase 3.
+//   sqdrive write CART PATH [OFFSET]   stdin into a file (made if need be) at OFFSET
+//   sqdrive truncate CART PATH SIZE    cut or grow a file
+//   sqdrive rm CART PATH               remove a file
+//   sqdrive mv CART FROM TO            rename a file (its content is not copied)
+//   sqdrive commit CART                commit what an earlier --keep left in the journal
+//   sqdrive recover CART --discard     set aside a journal the cartridge moved past
+//
+// Each writing command commits when it is done, unless --keep is given:
+// then its changes wait, synced, in the journal (until `commit` or the next
+// mount that commits). SQDRIVE_STAGING names the journals' folder.
+//
 
 import std;
 import sq.cart;
@@ -21,7 +31,13 @@ int usage() {
     std::println(std::cerr, "usage: sqdrive ls CART [PREFIX]\n"
                             "       sqdrive stat CART PATH\n"
                             "       sqdrive cat CART PATH [OFFSET [N]]\n"
-                            "       sqdrive bench CART PATH");
+                            "       sqdrive bench CART PATH\n"
+                            "       sqdrive write CART PATH [OFFSET] [--keep]\n"
+                            "       sqdrive truncate CART PATH SIZE [--keep]\n"
+                            "       sqdrive rm CART PATH [--keep]\n"
+                            "       sqdrive mv CART FROM TO [--keep]\n"
+                            "       sqdrive commit CART\n"
+                            "       sqdrive recover CART --discard");
     return 2;
 }
 
@@ -67,7 +83,7 @@ int bench(Drive& drive, const File& f) {
     drive.drop_cache();
     const auto cold = sequential();
     const auto warm = sequential();
-    if (!cold || !warm) return fail(Error{Code::io, "a read failed", f.entry().path});
+    if (!cold || !warm) return fail(Error{Code::io, "a read failed", f.path()});
     std::println("sequential, cold: {:.1f} MiB/s", mib_per_s(cold->first, cold->second));
     std::println("sequential, warm: {:.1f} MiB/s", mib_per_s(warm->first, warm->second));
     std::mt19937_64 rng(1);
@@ -75,7 +91,7 @@ int bench(Drive& drive, const File& f) {
     const auto t0 = clock::now();
     for (int i = 0; i < reads; ++i) {
         const std::uint64_t at = f.size() > 4096 ? rng() % (f.size() - 4096) : 0;
-        if (!f.read(at, std::span(buf).first(4096))) return fail(Error{Code::io, "a read failed", f.entry().path});
+        if (!f.read(at, std::span(buf).first(4096))) return fail(Error{Code::io, "a read failed", f.path()});
     }
     const auto us = std::chrono::duration<double, std::micro>(clock::now() - t0).count() / reads;
     const auto s = drive.cache_stats();
@@ -86,10 +102,59 @@ int bench(Drive& drive, const File& f) {
 
 }  // namespace
 
+int writing(std::string_view cmd, std::vector<std::string_view> args) {
+    const bool keep = std::erase(args, std::string_view("--keep")) > 0;
+    const bool discard = std::erase(args, std::string_view("--discard")) > 0;
+    MountOptions o;
+    o.access = Access::read_write;
+    o.commit = keep ? Policy::explicit_only : Policy::on_unmount;
+    o.discard_journal = discard;
+    if (const char* s = std::getenv("SQDRIVE_STAGING"); s != nullptr && *s != 0) o.staging = s;
+    if (cmd == "recover" && !discard) return usage();
+    auto drive = Drive::mount(std::filesystem::path(args[1]), o);
+    if (!drive) return fail(drive.error());
+    Result<void> r;
+    if (cmd == "write" && args.size() >= 3) {
+        const auto offset = args.size() > 3 ? number(args[3]) : std::optional<std::uint64_t>(0);
+        if (!offset) return usage();
+        auto f = drive->open(args[2], mode::write | mode::create);
+        if (!f) return fail(f.error());
+        std::vector<std::byte> buf(1 << 20);
+        std::uint64_t at = *offset;
+        while (r && std::cin.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(buf.size())).gcount() > 0) {
+            const auto got = static_cast<std::size_t>(std::cin.gcount());
+            r = f->write(at, std::span(buf).first(got));
+            at += got;
+        }
+    } else if (cmd == "truncate" && args.size() >= 4) {
+        const auto size = number(args[3]);
+        if (!size) return usage();
+        auto f = drive->open(args[2], mode::write);
+        if (!f) return fail(f.error());
+        r = f->resize(*size);
+    } else if (cmd == "rm" && args.size() >= 3) {
+        r = drive->remove(args[2]);
+    } else if (cmd == "mv" && args.size() >= 4) {
+        r = drive->rename(args[2], args[3]);
+    } else if (cmd != "commit" && cmd != "recover") {
+        return usage();
+    }
+    if (!r) return fail(r.error());
+    if (cmd == "commit") {
+        auto c = drive->commit();
+        if (!c) return fail(c.error());
+    }
+    if (auto u = drive->unmount(); !u) return fail(u.error());
+    const auto head = drive->head();
+    std::println(std::cerr, "{}: commit {}{}", drive->path().string(), head.sequence, keep ? ", changes kept in the journal" : "");
+    return 0;
+}
+
 int main(int argc, char** argv) {
     const std::vector<std::string_view> args(argv + 1, argv + argc);
     if (args.size() < 2) return usage();
     const std::string_view cmd = args[0];
+    if (cmd == "write" || cmd == "truncate" || cmd == "rm" || cmd == "mv" || cmd == "commit" || cmd == "recover") return writing(cmd, args);
     auto drive = Drive::mount(std::filesystem::path(args[1]));
     if (!drive) return fail(drive.error());
     if (cmd == "ls") {
