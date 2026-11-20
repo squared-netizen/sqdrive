@@ -72,6 +72,7 @@ sqdrive rm CART PATH [--keep]
 sqdrive mv CART FROM TO [--keep]
 sqdrive commit CART                            # what --keep left in the journal
 sqdrive recover CART --discard
+sqdrive --help | --version                     # the commands; the release
 ```
 
 ## On Android, and in sqterm

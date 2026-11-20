@@ -13,6 +13,8 @@
 //   sqdrive mv CART FROM TO            rename a file (its content is not copied)
 //   sqdrive commit CART                commit what an earlier --keep left in the journal
 //   sqdrive recover CART --discard     set aside a journal the cartridge moved past
+//   sqdrive --help | -h | help         this list, on stdout
+//   sqdrive --version | version        "sqdrive VERSION"
 //
 // Each writing command commits when it is done, unless --keep is given:
 // then its changes wait, synced, in the journal (until `commit` or the next
@@ -27,8 +29,13 @@ using namespace sq::drive;
 
 namespace {
 
-int usage() {
-    std::println(std::cerr, "usage: sqdrive ls CART [PREFIX]\n"
+/// The release this is: the tag it is built from, less its v (raised with each tag).
+constexpr std::string_view version = "0.5.0";
+
+/// The commands, on `out`; to stderr after a mistake (status 2), to stdout
+/// when asked for (status 0).
+int usage(std::ostream& out = std::cerr, int status = 2) {
+    std::println(out, "usage: sqdrive ls CART [PREFIX]\n"
                             "       sqdrive stat CART PATH\n"
                             "       sqdrive cat CART PATH [OFFSET [N]]\n"
                             "       sqdrive bench CART PATH\n"
@@ -37,8 +44,9 @@ int usage() {
                             "       sqdrive rm CART PATH [--keep]\n"
                             "       sqdrive mv CART FROM TO [--keep]\n"
                             "       sqdrive commit CART\n"
-                            "       sqdrive recover CART --discard");
-    return 2;
+                            "       sqdrive recover CART --discard\n"
+                            "       sqdrive --help | --version");
+    return status;
 }
 
 int fail(const Error& e) {
@@ -152,6 +160,11 @@ int writing(std::string_view cmd, std::vector<std::string_view> args) {
 
 int main(int argc, char** argv) {
     const std::vector<std::string_view> args(argv + 1, argv + argc);
+    if (!args.empty() && (args[0] == "--help" || args[0] == "-h" || args[0] == "help")) return usage(std::cout, 0);
+    if (!args.empty() && (args[0] == "--version" || args[0] == "version")) {
+        std::println("sqdrive {}", version);
+        return 0;
+    }
     if (args.size() < 2) return usage();
     const std::string_view cmd = args[0];
     if (cmd == "write" || cmd == "truncate" || cmd == "rm" || cmd == "mv" || cmd == "commit" || cmd == "recover") return writing(cmd, args);
