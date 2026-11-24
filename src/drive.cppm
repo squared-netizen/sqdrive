@@ -185,6 +185,43 @@ private:
     std::shared_ptr<File::State> state_;
 };
 
+/// How `pack` makes a cartridge of a folder.
+struct PackOptions {
+    /// Top-level folders named with a dot to pack all the same (".git", for
+    /// one's own backup); every other one is a tool's working state, left out.
+    std::vector<std::string> keep;
+    /// Paths in the folder left out with everything under them: what is
+    /// made, not kept (a workspace's "build").
+    std::vector<std::string> leave_out;
+    /// How the cartridge is written (level, sync, lock).
+    sq::cart::WriteOptions write{};
+};
+
+/// A folder holding SQ-INF/manifest.json (an exploded cartridge) packed into
+/// a new cartridge, `cartridge`, as one commit: sqcart's exploded form (its
+/// SQ-INF/entries.json metadata, names in NFC, links refused, dot folders
+/// left out), each file read at the commit a MiB at a time, so no file is
+/// held whole whatever its size. Refuses a cartridge that is there already.
+Result<sq::cart::Commit> pack(const std::filesystem::path& folder, const std::filesystem::path& cartridge,
+                              PackOptions options = {});
+
+/// How `explode` writes a cartridge out as a folder.
+struct ExplodeOptions {
+    /// Write into a folder that has files already (never over one).
+    bool merge = false;
+    /// Make an entry flagged x executable: for one's own backup only; a
+    /// cartridge from elsewhere never puts a program on the disk unasked.
+    bool executable = false;
+    sq::cart::ReadOptions read{};
+};
+
+/// A cartridge written out as a folder (sqcart's exploded form): every live
+/// entry a file, each read and verified before it lands (a chunked one a
+/// chunk at a time, through NAME.part), SQ-INF/entries.json for what a file
+/// system cannot hold. The number of files written.
+Result<std::size_t> explode(const std::filesystem::path& cartridge, const std::filesystem::path& folder,
+                            ExplodeOptions options = {});
+
 }  // namespace sq::drive
 
 namespace sq::drive {
@@ -1622,5 +1659,20 @@ fs::path Drive::journal_path() const {
 }
 CacheStats Drive::cache_stats() const { return state_->cache.stats(); }
 void Drive::drop_cache() { state_->cache.clear(); }
+
+Result<sq::cart::Commit> pack(const fs::path& folder, const fs::path& cartridge, PackOptions options) {
+    std::error_code ec;
+    if (fs::exists(fs::symlink_status(cartridge, ec))) {
+        return fail(Code::io, cartridge.string() + " is there already: pack makes a new cartridge");
+    }
+    return sq::cart::pack(folder, cartridge, options.write,
+                          {.keep = std::move(options.keep), .leave_out = std::move(options.leave_out)});
+}
+
+Result<std::size_t> explode(const fs::path& cartridge, const fs::path& folder, ExplodeOptions options) {
+    auto archive = sq::cart::Archive::open(cartridge, options.read);
+    if (!archive) return std::unexpected(archive.error());
+    return sq::cart::unpack(*archive, folder, {.merge = options.merge, .executable = options.executable});
+}
 
 }  // namespace sq::drive

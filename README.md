@@ -71,9 +71,21 @@ sqdrive truncate CART PATH SIZE [--keep]
 sqdrive rm CART PATH [--keep]
 sqdrive mv CART FROM TO [--keep]
 sqdrive commit CART                            # what --keep left in the journal
+sqdrive pack DIR CART [--keep .NAME]... [--leave-out PATH]...   # a folder into a new cartridge
+sqdrive explode CART DIR [--merge]             # a cartridge out as a folder
 sqdrive recover CART --discard
 sqdrive --help | --version                     # the commands; the release
 ```
+
+**Folders.** `pack(folder, cartridge, {keep, leave_out})` makes a new
+cartridge of an exploded one (a folder holding `SQ-INF/manifest.json`), and
+`explode(cartridge, folder)` writes one out: sqcart's exploded form, its
+rules sqcart's (`SQ-INF/entries.json`, names in NFC, links refused, dot
+folders left out unless kept). Neither holds a file whole: pack reads each
+at the commit a MiB at a time, and explode writes a chunked entry a
+verified chunk at a time. The SDK's tools pack and explode through these
+(square's workspaces), never through sqcart directly: sqcart is the format,
+the Drive is how the tools move cartridges.
 
 ## On Android, and in sqterm
 

@@ -6,6 +6,9 @@
 //   sqdrive stat CART PATH             one entry's record
 //   sqdrive cat CART PATH [OFFSET [N]] bytes, verified, to stdout
 //   sqdrive bench CART PATH            sequential and random reads, cold and warm
+//   sqdrive pack DIR CART [--keep .NAME]... [--leave-out PATH]...
+//                                      a folder (SQ-INF/manifest.json) into a new cartridge
+//   sqdrive explode CART DIR [--merge] a cartridge out as a folder, every byte verified
 //
 //   sqdrive write CART PATH [OFFSET]   stdin into a file (made if need be) at OFFSET
 //   sqdrive truncate CART PATH SIZE    cut or grow a file
@@ -30,7 +33,7 @@ using namespace sq::drive;
 namespace {
 
 /// The release this is: the tag it is built from, less its v (raised with each tag).
-constexpr std::string_view version = "0.5.0";
+constexpr std::string_view version = "0.6.0";
 
 /// The commands, on `out`; to stderr after a mistake (status 2), to stdout
 /// when asked for (status 0).
@@ -39,6 +42,8 @@ int usage(std::ostream& out = std::cerr, int status = 2) {
                             "       sqdrive stat CART PATH\n"
                             "       sqdrive cat CART PATH [OFFSET [N]]\n"
                             "       sqdrive bench CART PATH\n"
+                            "       sqdrive pack DIR CART [--keep .NAME]... [--leave-out PATH]...\n"
+                            "       sqdrive explode CART DIR [--merge]\n"
                             "       sqdrive write CART PATH [OFFSET] [--keep]\n"
                             "       sqdrive truncate CART PATH SIZE [--keep]\n"
                             "       sqdrive rm CART PATH [--keep]\n"
@@ -167,6 +172,30 @@ int main(int argc, char** argv) {
     }
     if (args.size() < 2) return usage();
     const std::string_view cmd = args[0];
+    if (cmd == "pack" || cmd == "explode") {
+        if (args.size() < 3) return usage();
+        if (cmd == "explode") {
+            ExplodeOptions o;
+            for (std::size_t i = 3; i < args.size(); ++i) {
+                if (args[i] == "--merge") o.merge = true;
+                else return usage();
+            }
+            auto n = explode(std::filesystem::path(args[1]), std::filesystem::path(args[2]), o);
+            if (!n) return fail(n.error());
+            std::println(std::cerr, "{}: {} files", args[2], *n);
+            return 0;
+        }
+        PackOptions o;
+        for (std::size_t i = 3; i < args.size(); ++i) {
+            if (args[i] == "--keep" && i + 1 < args.size()) o.keep.emplace_back(args[++i]);
+            else if (args[i] == "--leave-out" && i + 1 < args.size()) o.leave_out.emplace_back(args[++i]);
+            else return usage();
+        }
+        auto c = pack(std::filesystem::path(args[1]), std::filesystem::path(args[2]), o);
+        if (!c) return fail(c.error());
+        std::println(std::cerr, "{}: commit {}", args[2], c->sequence);
+        return 0;
+    }
     if (cmd == "write" || cmd == "truncate" || cmd == "rm" || cmd == "mv" || cmd == "commit" || cmd == "recover") return writing(cmd, args);
     auto drive = Drive::mount(std::filesystem::path(args[1]));
     if (!drive) return fail(drive.error());
