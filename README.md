@@ -114,8 +114,8 @@ packages). Its journals go in `~/.local/state/sqdrive`, or
 ## Building
 
 ```sh
-make test
-make CXX=/usr/lib/llvm-23/bin/clang++ test
+sqmake test                                  # build.lua
+CXX=/usr/lib/llvm-23/bin/clang++ sqmake test
 ```
 
 Needs clang and libc++ with `import std;`; 23 is what sqterm and CI use.
