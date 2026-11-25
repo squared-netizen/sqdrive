@@ -17,7 +17,7 @@ OUT=$ROOT/third_party/sqcart
 rm -rf "$OUT"
 mkdir -p "$OUT/v3/src" "$OUT/third_party"
 cp "$SRC"/v3/src/*.cppm "$SRC"/v3/src/*.inc "$OUT/v3/src/"
-cp "$SRC/v3/Makefile" "$OUT/v3/"
+cp "$SRC/v3/build.lua" "$OUT/v3/"   # included by build.lua (sqcart_settings)
 cp "$SRC/LICENSE" "$OUT/"
 for d in monocypher-4.0.3 squared-data yyjson-0.12.0 zstd-1.5.7; do
   cp -R "$SRC/third_party/$d" "$OUT/third_party/"
