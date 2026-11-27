@@ -21,7 +21,7 @@ if top then
   local opt = mode.debug and {"-O0", "-g"} or {"-O2", "-g"}
   toolchain.cxxflags = {"-std=c++23", "-stdlib=libc++", opt}
   toolchain.cflags = {opt}
-  toolchain.ldflags = {"-stdlib=libc++", "-lpthread"}
+  toolchain.ldflags = {"-stdlib=libc++", "-pthread"}  -- -pthread: Android has no libpthread
 end
 
 local warn = {"-Wall", "-Wextra", "-Wpedantic", "-Wconversion", "-Wno-sign-conversion",
